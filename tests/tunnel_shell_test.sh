@@ -61,7 +61,7 @@ expect_eq "client_code_matches_cxx_golden" "$CLIENT_CODE" \
 expect_eq "client_code_roundtrip" "$WIN_PUB 10.77.77.2" "$("$sh" decode-client-code "$CLIENT_CODE")"
 
 # Descriptors must not be able to carry private material: the payload is exactly two fields.
-body="$(printf '%s' "${CLIENT_CODE#SCCL1:}" | tr -- '-_' '+/' | { read -r s; case $(( ${#s} % 4 )) in 2) s="${s}==";; 3) s="${s}=";; esac; printf '%s' "$s"; } | base64 --decode 2>/dev/null || true)"
+body="$(printf '%s' "${CLIENT_CODE#SCCL1:}" | tr -- '-_' '+/' | { read -r s; case $(( ${#s} % 4 )) in (2) s="${s}==";; (3) s="${s}=";; esac; printf '%s' "$s"; } | base64 --decode 2>/dev/null || true)"
 expect_eq "client_code_payload_is_public_only" "k=${WIN_PUB}
 c=10.77.77.2" "$body"
 

@@ -57,7 +57,7 @@ need_root() { [ "$(id -u)" = "0" ] || die "this command must run as root (use su
 # Locates a supported WireGuard implementation. Homebrew installs under /usr/local or /opt/homebrew.
 find_wireguard() {
     local extra="/opt/homebrew/bin:/usr/local/bin:/usr/local/sbin:/opt/homebrew/sbin"
-    PATH="${PATH}:${extra}"
+    PATH="${extra}:${PATH}"
     export PATH
     command -v wg >/dev/null 2>&1 || die "wg not found — install WireGuard tools (brew install wireguard-tools)"
     command -v wg-quick >/dev/null 2>&1 || die "wg-quick not found — install WireGuard tools (brew install wireguard-tools)"
@@ -150,7 +150,7 @@ decode_client_code() {
     esac
     local payload="${code#SCCL1:}"
     [ -n "$payload" ] || die "empty pairing descriptor"
-    printf '%s' "$payload" | grep -Eq '^[A-Za-z0-9_-]{1,1024}$' || die "invalid base64url payload"
+    [ "${#payload}" -le 1024 ] && printf '%s' "$payload" | grep -Eq '^[A-Za-z0-9_-]+$' || die "invalid base64url payload"
     body="$(printf '%s' "$payload" | b64url_decode)" || die "invalid base64url payload"
     [ "$(printf '%s' "$body" | wc -l | tr -d ' ')" = "1" ] || die "malformed pairing descriptor"
     WIN_PUB="$(printf '%s' "$body" | sed -n '1s/^k=//p')"
