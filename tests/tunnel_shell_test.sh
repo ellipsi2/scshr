@@ -78,7 +78,7 @@ firewall" "$("$sh" render-preflight-keys)"
 # on Homebrew wireguard-tools or on a bash newer than the 3.2 macOS ships.
 script_text="$(cat "$sh")"
 case "$script_text" in
-    *wg-quick*|*"brew install"*|*BASH_VERSINFO*)
+    *"wg-quick up"*|*"wg-quick down"*|*"wg-quick strip"*|*"command -v wg"*|*"brew install"*|*BASH_VERSINFO*)
         bad "no_wireguard_tools_dependency" "the script still needs wireguard-tools or bash 4+" ;;
     *) ok "no_wireguard_tools_dependency" ;;
 esac

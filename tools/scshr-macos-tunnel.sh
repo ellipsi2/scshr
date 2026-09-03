@@ -433,6 +433,71 @@ daemon_unload() {
     # A helper killed outright leaves both behind; the socket is unlinked on the next open, but a
     # stale interface name would make `status` report an interface that no longer exists.
     if ! tunnel_is_up; then rm -f "$UAPI_SOCKET" "$UTUN_NAME_FILE"; fi
+    stop_stale_tunnels
+}
+
+# Terminates pids, politely first. <pids...>
+kill_wait() {
+    [ $# -gt 0 ] || return 0
+    kill "$@" 2>/dev/null || true
+    local i=0
+    while [ "$i" -lt 5 ]; do
+        if ! kill -0 "$@" 2>/dev/null; then return 0; fi
+        sleep 1
+        i=$((i+1))
+    done
+    kill -9 "$@" 2>/dev/null || true
+    sleep 1
+}
+
+# Anything still holding our listen port (or still running as our helper) when the daemon is
+# unloaded is a leftover: a helper launchd lost track of, or a tunnel started by the previous
+# wg-quick-based version of this script (its interface marker is /var/run/wireguard/scshr.name).
+# wireguard-go treats a failed bind as non-fatal and silently takes an ephemeral port, which
+# strands the Windows peer on udp/<port> with nobody listening — so these MUST go before a new
+# helper starts. A foreign program on the port is never killed: that is a configuration error.
+stop_stale_tunnels() {
+    local port pids pid comm legacy_name legacy_marker="/var/run/wireguard/${TUNNEL_NAME}.name"
+    port="$(setting listen_port "$DEFAULT_LISTEN_PORT")"
+
+    pids="$(pgrep -f "scshr-tunnel run" 2>/dev/null || true)"
+    if [ -n "$pids" ]; then
+        info "stopping a leftover scshr tunnel helper (pid $(printf '%s' "$pids" | tr '\n' ' '))"
+        # shellcheck disable=SC2086
+        kill_wait $pids
+    fi
+
+    if [ -f "$legacy_marker" ]; then
+        legacy_name="$(cat "$legacy_marker" 2>/dev/null || true)"
+        info "stopping the tunnel left by the previous wg-quick-based scshr script (${legacy_name:-unknown interface})"
+        pids="$(pgrep -f "wg-quick.*${TUNNEL_NAME}" 2>/dev/null || true)"
+        # shellcheck disable=SC2086
+        [ -z "$pids" ] || kill_wait $pids
+    fi
+
+    pids="$(lsof -t -iUDP:"$port" 2>/dev/null || true)"
+    for pid in $pids; do
+        comm="$(ps -o comm= -p "$pid" 2>/dev/null || true)"
+        case "$(basename "${comm:-?}")" in
+            scshr-tunnel|wireguard-go|wireguard)
+                if [ -f "$legacy_marker" ] || [ "$(basename "$comm")" = "scshr-tunnel" ]; then
+                    info "stopping stale tunnel process ${comm} (pid ${pid}) holding udp/${port}"
+                    kill_wait "$pid"
+                else
+                    die "udp/${port} is held by another WireGuard tunnel (${comm}, pid ${pid}) — stop it or run init with --listen-port"
+                fi ;;
+            *)
+                die "udp/${port} is in use by ${comm:-an unknown program} (pid ${pid}) — stop it or run init with --listen-port" ;;
+        esac
+    done
+
+    if [ -f "$legacy_marker" ]; then
+        rm -f "$legacy_marker"
+        [ -z "${legacy_name:-}" ] || rm -f "/var/run/wireguard/${legacy_name}.sock"
+    fi
+    # Routes from a dead interface are replaced by the helper; drop the peer route here too so a
+    # stale one cannot steal replies while the daemon is restarting.
+    route -q -n delete -inet "$(setting win_ip "$DEFAULT_WIN_IP")/32" >/dev/null 2>&1 || true
 }
 daemon_load() {
     [ -f "$LAUNCHD_PLIST" ] || die "the scshr LaunchDaemon is not installed — run 'init' first"
@@ -446,13 +511,18 @@ tunnel_is_up() { [ -n "$HELPER" ] && "$HELPER" status >/dev/null 2>&1; }
 # 30s, not 10: a helper that lost a race with its predecessor is restarted by KeepAlive only after
 # launchd's 10 s throttle, and that retry must still be inside the window.
 wait_up() {
-    local i=0
+    local i=0 want got
     while [ "$i" -lt 30 ]; do
-        if tunnel_is_up; then return 0; fi
+        if tunnel_is_up; then break; fi
         sleep 1
         i=$((i+1))
     done
-    tunnel_is_up
+    tunnel_is_up || return 1
+    # The helper refuses to run on the wrong port, so this is belt and braces for older helpers.
+    want="$(setting listen_port "$DEFAULT_LISTEN_PORT")"
+    got="$("$HELPER" status 2>/dev/null | sed -n 's/^listen_port=//p')"
+    [ -z "$got" ] || [ "$got" = "$want" ] ||
+        die "the tunnel came up on udp/${got} instead of udp/${want} — something else holds that port; see ${TUNNEL_LOG}"
 }
 
 # Executed by launchd. PF first and fail closed: if isolation cannot be activated the tunnel must
