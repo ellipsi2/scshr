@@ -22,49 +22,45 @@ RecordLayer::RecordLayer(ByteView blob, ByteView wrap_key) {
 }
 
 Bytes RecordLayer::encrypt_message(ByteView pt) {
-    std::lock_guard<std::mutex> lk(mu_);
-    const uint32_t counter = enc_ctr_;
+    // Caller holds send_mutex() (see the header): no lock here.
+    const uint32_t counter = enc_ctr_.load();
     const size_t pad = (BLOCK - ((2 + pt.size() + MAC_LEN) % BLOCK)) % BLOCK;
     Bytes framed(2 + pt.size() + pad + MAC_LEN);
     put_be16(framed.data(), uint16_t(pt.size()));
     std::memcpy(framed.data() + 2, pt.data(), pt.size());
     // zero filler (receivers must not validate filler contents)
     uint8_t seq_be[4]; put_be32(seq_be, counter);
-    sha_.reset();
-    sha_.update(ByteView(seq_be, 4));
-    sha_.update(ByteView(framed.data(), 2 + pt.size() + pad));
-    auto mac = sha_.final();
+    enc_sha_.reset();
+    enc_sha_.update(ByteView(seq_be, 4));
+    enc_sha_.update(ByteView(framed.data(), 2 + pt.size() + pad));
+    auto mac = enc_sha_.final();
     std::memcpy(framed.data() + 2 + pt.size() + pad, mac.data(), MAC_LEN);
     Bytes out(2 + framed.size());
     put_be16(out.data(), uint16_t(framed.size()));
     enc_->process(view(framed), out.data() + 2);
-    enc_ctr_ = counter + 1;
+    enc_ctr_.store(counter + 1);
     return out;
 }
 
 std::optional<Bytes> RecordLayer::decrypt_message(ByteView ct) {
     if (ct.empty() || ct.size() % BLOCK) return std::nullopt;
     Bytes pt(ct.size());
-    uint32_t ctr_start;
-    {
-        std::lock_guard<std::mutex> lk(mu_);
-        // CBC must consume every received block regardless of MAC outcome (chaining state).
-        dec_->process(ct, pt.data());
-        ctr_start = dec_ctr_;
-        dec_ctr_ += 1;
-    }
+    // CBC must consume every received block regardless of MAC outcome (chaining state).
+    dec_->process(ct, pt.data());
+    const uint32_t ctr_start = dec_ctr_.load();
+    dec_ctr_.store(ctr_start + 1);
     if (pt.size() <= MAC_LEN) return pt;
     const size_t body_len = pt.size() - MAC_LEN;
     const uint8_t* mac = pt.data() + body_len;
     const uint32_t lo = ctr_start > 0 ? ctr_start - 1 : 0;
     for (uint32_t c = lo; c < ctr_start + DECRYPT_COUNTER_WINDOW; ++c) {
         uint8_t seq_be[4]; put_be32(seq_be, c);
-        sha_.reset();
-        sha_.update(ByteView(seq_be, 4));
-        sha_.update(ByteView(pt.data(), body_len));
-        auto d = sha_.final();
+        dec_sha_.reset();
+        dec_sha_.update(ByteView(seq_be, 4));
+        dec_sha_.update(ByteView(pt.data(), body_len));
+        auto d = dec_sha_.final();
         if (std::memcmp(d.data(), mac, MAC_LEN) == 0) {
-            { std::lock_guard<std::mutex> lk(mu_); dec_ctr_ = c + 1; }
+            dec_ctr_.store(c + 1);
             const size_t inner = be16(pt.data());
             if (2 + inner > body_len) return std::nullopt;
             return Bytes(pt.begin() + 2, pt.begin() + 2 + ptrdiff_t(inner));

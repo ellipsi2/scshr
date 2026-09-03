@@ -54,6 +54,36 @@ TEST(record_layer_roundtrip_and_counter_window) {
     CHECK_EQ(o2.size(), size_t(1));   // second record survives thanks to the [ctr-1, ctr+5] window
 }
 
+TEST(record_layer_send_under_send_mutex_while_receiving) {
+    // Regression: Session::send_ctrl holds send_mutex() across encrypt+send. encrypt_message() must not
+    // re-lock that mutex (std::mutex is not recursive: the second lock throws "resource deadlock would
+    // occur", and every control message was being dropped). Also exercise concurrent decrypt on another
+    // thread with sends in flight: the two directions must not share hash state.
+    Bytes wrap = crypto::random_bytes(16), key = crypto::random_bytes(16), iv = crypto::random_bytes(16);
+    crypto::Aes128Ecb ecb(view(wrap));
+    Bytes blob(36, 0); ecb.encrypt_block(key.data(), blob.data() + 4); ecb.encrypt_block(iv.data(), blob.data() + 20);
+    RecordLayer client(view(blob), view(wrap)), server(view(blob), view(wrap));
+    Bytes inbound;                                    // server → client stream, produced up front
+    for (int i = 0; i < 200; ++i) { Bytes m(size_t(i % 50 + 1), uint8_t(i)); Bytes e = server.encrypt_message(view(m)); inbound.insert(inbound.end(), e.begin(), e.end()); }
+    std::vector<Bytes> received;
+    std::thread rx([&] { client.decrypt_stream(view(inbound), received); });
+    Bytes outbound; bool threw = false;
+    for (int i = 0; i < 200; ++i) {
+        try {
+            std::lock_guard<std::mutex> lk(client.send_mutex());
+            Bytes e = client.encrypt_message(view(Bytes(size_t(i % 30 + 1), uint8_t(i))));
+            outbound.insert(outbound.end(), e.begin(), e.end());
+        } catch (const std::exception&) { threw = true; }
+    }
+    rx.join();
+    CHECK(!threw);
+    CHECK_EQ(client.send_counter(), uint32_t(200));
+    std::vector<Bytes> server_got;
+    CHECK_EQ(server.decrypt_stream(view(outbound), server_got), outbound.size());
+    CHECK_EQ(server_got.size(), size_t(200));
+    CHECK_EQ(received.size(), size_t(200));
+}
+
 TEST(hmac_context_reuse_is_stateless) {
     Bytes k = crypto::random_bytes(20);
     crypto::HmacSha1 h(view(k));
