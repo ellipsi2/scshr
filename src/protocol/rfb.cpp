@@ -37,6 +37,14 @@ std::optional<LayoutInfo> parse_apple_display_layout(ByteView p) {
     return li;
 }
 
+std::optional<LayoutGeometry> parse_apple_display_geometry(ByteView p) {
+    if (p.size() < 10) return std::nullopt;
+    LayoutGeometry g;
+    g.scaled_w = be16(p.data() + 2); g.scaled_h = be16(p.data() + 4);
+    g.backing_w = be16(p.data() + 6); g.backing_h = be16(p.data() + 8);
+    return g;
+}
+
 Bytes build_set_encodings() {
     Writer w;
     w.u8(0x02).u8(0).u16(uint16_t(std::size(HP_ENCODINGS_FULL)));

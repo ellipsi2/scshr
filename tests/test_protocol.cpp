@@ -52,3 +52,15 @@ TEST(layout_parse_bounds) {
     auto li = rfb::parse_apple_display_layout(view(q));
     CHECK(li && li->rects.size() == 1 && li->rects[0].w == 3840 && li->backing_h == 2160);
 }
+
+// The 0x451 geometry header sits INSIDE the payload (after the u16 prefix): ver | scaled_w/h | backing_w/h.
+// Regression: the session used to read it 2 bytes early (version → scaled_w, …, backing_w → backing_h), which
+// set the runtime canvas to (scaled_h, backing_w) and cropped the picture to a stretched left slice.
+TEST(layout_geometry_header) {
+    Bytes p(10, 0); put_be16(&p[0], 7); put_be16(&p[2], 1632); put_be16(&p[4], 918); put_be16(&p[6], 3264); put_be16(&p[8], 1836);
+    auto g = rfb::parse_apple_display_geometry(view(p));
+    CHECK(g && g->scaled_w == 1632 && g->scaled_h == 918 && g->backing_w == 3264 && g->backing_h == 1836);
+    CHECK(!rfb::parse_apple_display_geometry(ByteView(p.data(), 9)));
+    // Header-only layouts (no display rects) still carry usable geometry, exactly like session.py.
+    CHECK(!rfb::parse_apple_display_layout(view(p)) && rfb::parse_apple_display_geometry(view(p)));
+}

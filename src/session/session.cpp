@@ -440,13 +440,22 @@ void Session::note_unknown_ssrc(uint32_t ssrc, int64_t now) {
     ++ssrc_changes_;
     last_publish_ns_ = now;   // grace window before another adoption can trigger
     if (!decoder_) return;
-    std::lock_guard<std::recursive_mutex> lk(policy_mu_);
-    if (needs_param_harvest_.load()) { LOG_INFO("session", "SSRC adoption deferred — waiting for param harvest"); dpb_error_window_.clear(); request_fir(); return; }
-    dpb_error_window_.clear();
-    const int64_t last_restart = last_decoder_restart_ns_;
-    const bool must_restart = cfg_.codec == VideoCodec::Avc || now - last_restart >= 3'000'000'000;
+    // Decide under policy_mu_, act after releasing it: decoder_->restart() takes the codec lock, and the decoder
+    // thread re-enters this session (on_libav_concealment → policy_mu_) from libav's log hook while holding that
+    // same codec lock. Holding policy_mu_ across restart() is a lock-order inversion that deadlocks both threads.
+    bool deferred = false, must_restart = false;
+    {
+        std::lock_guard<std::recursive_mutex> lk(policy_mu_);
+        dpb_error_window_.clear();
+        if (needs_param_harvest_.load()) deferred = true;
+        else {
+            const int64_t last_restart = last_decoder_restart_ns_;
+            must_restart = cfg_.codec == VideoCodec::Avc || now - last_restart >= 3'000'000'000;
+            if (must_restart) last_decoder_restart_ns_ = now;
+        }
+    }
+    if (deferred) { LOG_INFO("session", "SSRC adoption deferred — waiting for param harvest"); request_fir(); return; }
     if (must_restart) {
-        last_decoder_restart_ns_ = now;
         if (cfg_.codec == VideoCodec::Avc) LOG_INFO("session", "AVC SSRC generation change: resetting decoder DPB before fresh keyframe");
         decoder_->restart();
     }
@@ -583,8 +592,9 @@ void Session::handle_fbu(ByteView msg) {
                     LOG_INFO("session", "AppleDisplayLayout: %zu display(s): %s", layout->rects.size(), s.c_str());
                 }
             }
-            if (plen >= 10) {
-                const int sw = be16(msg.data() + off + 2), sh = be16(msg.data() + off + 4), bw = be16(msg.data() + off + 6), bh = be16(msg.data() + off + 8);
+            // Geometry header lives INSIDE the payload (after the u16 prefix): ver, scaled_w/h, backing_w/h.
+            if (auto geom = rfb::parse_apple_display_geometry(msg.subspan(off + 2, plen))) {
+                const int sw = geom->scaled_w, sh = geom->scaled_h, bw = geom->backing_w, bh = geom->backing_h;
                 const int new_bw = (bw && bh) ? bw : runtime_canvas_w_.load(), new_bh = (bw && bh) ? bh : runtime_canvas_h_.load();
                 if (sw && sh) {
                     const bool had = runtime_canvas_w_ > 0 && runtime_canvas_h_ > 0;
@@ -799,47 +809,53 @@ void Session::maybe_reanchor_d3d11va_avc(int64_t now) {
 
 void Session::check_stall(int64_t now) {
     if (!connected_ || last_publish_ns_ == 0 || !decoder_) return;
-    std::lock_guard<std::recursive_mutex> lk(policy_mu_);
-    const int64_t gap = now - last_publish_ns_;
-    const uint64_t cur_loss = assembler_ ? assembler_->lost_pkts : 0;
-    if (cur_loss > loss_at_prev_stall_check_) last_loss_growth_ns_ = now;
-    loss_at_prev_stall_check_ = cur_loss;
-    const bool recent_loss = now - last_loss_growth_ns_ < SATURATION_LOSS_FREE_WINDOW_NS;
-    const int64_t lp = assembler_ ? assembler_->last_video_pkt_ns : 0;
-    const bool pkts_flowing = lp > 0 && now - lp < 500'000'000;
-    const bool apple_idle = lp > 0 && now - lp >= 1'500'000'000;
-    // A: session-wide stall.
-    if (gap > SATURATION_RESTART_GAP_NS && !recent_loss && pkts_flowing && now - last_decoder_restart_ns_ >= 3'000'000'000) {
-        last_decoder_restart_ns_ = now;
-        LOG_WARN("session", "decoder stuck %.1fs, packets flowing, no loss for %.0fs — restart decoder + FIR", double(gap) / 1e9, double(SATURATION_LOSS_FREE_WINDOW_NS) / 1e9);
-        decoder_->restart(); request_fir(); return;
-    }
-    if (gap > 15'000'000'000 && now - last_decoder_restart_ns_ >= 8'000'000'000) {
-        if (apple_idle) return;
-        last_decoder_restart_ns_ = now;
-        LOG_WARN("session", "decoder stuck %.1fs (long); restart decoder + FIR storm", double(gap) / 1e9);
-        decoder_->restart(); request_fir(); return;
-    }
-    if (gap > 3'000'000'000 && now - last_stall_fir_ns_ >= 1'500'000'000) {
-        if (apple_idle) return;
-        last_stall_fir_ns_ = now;
-        size_t required; { std::lock_guard<std::mutex> g(decoder_->gate_mutex()); required = decoder_->gate().keyframe_required().size(); }
-        if (int(required) >= num_tiles()) LOG_WARN("session", "decoder stuck %.1fs (gate already recovering all tiles, deferring)", double(gap) / 1e9);
-        else { LOG_WARN("session", "decoder stuck %.1fs; FIR storm", double(gap) / 1e9); request_fir(); }
-    }
-    // B: persistent per-tile concealment.
-    constexpr int STUCK_TILE_ERRORS = 30;
-    int worst = 0; std::vector<int> stuck;
-    { std::lock_guard<std::mutex> g(decoder_->gate_mutex()); for (int i = 0; i < std::min(num_tiles(), decoder_->num_tiles()); ++i) { const int b = decoder_->gate().bad_streak(i); worst = std::max(worst, b); if (b >= STUCK_TILE_ERRORS) stuck.push_back(i); } }
-    if (worst >= STUCK_TILE_ERRORS) {
-        if (recent_loss) {
-            if (now - last_stuck_tile_fir_ns_ >= 2'000'000'000) { last_stuck_tile_fir_ns_ = now; LOG_WARN("session", "tile stuck (worst bad_streak=%d, loss active); FIR storm, no flush", worst); request_fir(); }
-        } else if (now - last_decoder_restart_ns_ >= 4'000'000'000) {
+    // Same lock discipline as note_unknown_ssrc(): decide under policy_mu_, restart the decoder after releasing it.
+    bool restart = false, fir = false;
+    {
+        std::lock_guard<std::recursive_mutex> lk(policy_mu_);
+        const int64_t gap = now - last_publish_ns_;
+        const uint64_t cur_loss = assembler_ ? assembler_->lost_pkts : 0;
+        if (cur_loss > loss_at_prev_stall_check_) last_loss_growth_ns_ = now;
+        loss_at_prev_stall_check_ = cur_loss;
+        const bool recent_loss = now - last_loss_growth_ns_ < SATURATION_LOSS_FREE_WINDOW_NS;
+        const int64_t lp = assembler_ ? assembler_->last_video_pkt_ns : 0;
+        const bool pkts_flowing = lp > 0 && now - lp < 500'000'000;
+        const bool apple_idle = lp > 0 && now - lp >= 1'500'000'000;
+        // A: session-wide stall.
+        if (gap > SATURATION_RESTART_GAP_NS && !recent_loss && pkts_flowing && now - last_decoder_restart_ns_ >= 3'000'000'000) {
             last_decoder_restart_ns_ = now;
-            LOG_WARN("session", "tile stuck (worst bad_streak=%d, no loss) — saturation wedge; restart decoder + FIR", worst);
-            decoder_->restart(); request_fir();
+            LOG_WARN("session", "decoder stuck %.1fs, packets flowing, no loss for %.0fs — restart decoder + FIR", double(gap) / 1e9, double(SATURATION_LOSS_FREE_WINDOW_NS) / 1e9);
+            restart = fir = true;
+        } else if (gap > 15'000'000'000 && now - last_decoder_restart_ns_ >= 8'000'000'000) {
+            if (apple_idle) return;
+            last_decoder_restart_ns_ = now;
+            LOG_WARN("session", "decoder stuck %.1fs (long); restart decoder + FIR storm", double(gap) / 1e9);
+            restart = fir = true;
+        } else {
+            if (gap > 3'000'000'000 && now - last_stall_fir_ns_ >= 1'500'000'000) {
+                if (apple_idle) return;
+                last_stall_fir_ns_ = now;
+                size_t required; { std::lock_guard<std::mutex> g(decoder_->gate_mutex()); required = decoder_->gate().keyframe_required().size(); }
+                if (int(required) >= num_tiles()) LOG_WARN("session", "decoder stuck %.1fs (gate already recovering all tiles, deferring)", double(gap) / 1e9);
+                else { LOG_WARN("session", "decoder stuck %.1fs; FIR storm", double(gap) / 1e9); fir = true; }
+            }
+            // B: persistent per-tile concealment.
+            constexpr int STUCK_TILE_ERRORS = 30;
+            int worst = 0;
+            { std::lock_guard<std::mutex> g(decoder_->gate_mutex()); for (int i = 0; i < std::min(num_tiles(), decoder_->num_tiles()); ++i) worst = std::max(worst, decoder_->gate().bad_streak(i)); }
+            if (worst >= STUCK_TILE_ERRORS) {
+                if (recent_loss) {
+                    if (now - last_stuck_tile_fir_ns_ >= 2'000'000'000) { last_stuck_tile_fir_ns_ = now; LOG_WARN("session", "tile stuck (worst bad_streak=%d, loss active); FIR storm, no flush", worst); fir = true; }
+                } else if (now - last_decoder_restart_ns_ >= 4'000'000'000) {
+                    last_decoder_restart_ns_ = now;
+                    LOG_WARN("session", "tile stuck (worst bad_streak=%d, no loss) — saturation wedge; restart decoder + FIR", worst);
+                    restart = fir = true;
+                }
+            }
         }
     }
+    if (restart) decoder_->restart();
+    if (fir) request_fir();
 }
 
 void Session::send_ltr_ack(int tile) {

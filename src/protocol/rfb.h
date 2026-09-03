@@ -24,6 +24,10 @@ struct LayoutInfo {
 };
 // Parse an AppleDisplayLayout (0x451) rect payload (after the u16 prefix). nullopt if unparseable.
 std::optional<LayoutInfo> parse_apple_display_layout(ByteView payload);
+// Header geometry only: ver u16 | scaled_w/h u16 | backing_w/h u16. Valid for any payload of ≥ 10 bytes, including
+// layouts that carry no display rects (session.py reads these fields independently of the rect list).
+struct LayoutGeometry { uint16_t scaled_w = 0, scaled_h = 0, backing_w = 0, backing_h = 0; };
+std::optional<LayoutGeometry> parse_apple_display_geometry(ByteView payload);
 
 Bytes build_set_encodings();
 Bytes build_post_encryption_toggle();                       // 0x12 cmd=2
