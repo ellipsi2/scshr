@@ -1,5 +1,6 @@
-# Stage a user-distributable zip from an existing Release build.
-# Usage: .\tools\package.ps1   (run .\build.ps1 first)
+# Stage a user-distributable folder + zip (+ SHA-256 sums) from an existing Release build.
+# Usage: .\tools\package.ps1 [-Version 0.1.0]   (run .\build.ps1 first; default version = git describe)
+param([string]$Version = "")
 $ErrorActionPreference = "Stop"
 $root = Split-Path $PSScriptRoot -Parent
 $rel = Join-Path $root "build\Release"
@@ -11,7 +12,8 @@ function Require-File($path) {
 
 Require-File (Join-Path $rel "scshr.exe")
 
-$version = (git -C $root describe --tags --always --dirty 2>$null)
+$version = $Version
+if (-not $version) { $version = (git -C $root describe --tags --always --dirty 2>$null) }
 if (-not $version) { $version = "0.0.0-unknown" }
 $version = $version.Trim()
 
@@ -36,6 +38,12 @@ else { Write-Warning "fdk-aac.dll not found in $rel; packaging without audio sup
 $macDir = Join-Path $rel "mac"
 Require-File $macDir
 Copy-Item $macDir (Join-Path $stage "mac") -Recurse -Force
+foreach ($m in @("scshr-macos-tunnel.sh", "scshr-tunnel-darwin-arm64", "scshr-tunnel-darwin-amd64")) {
+  Require-File (Join-Path $stage "mac\$m")
+}
+# The macOS script must stay LF: a CRLF copy fails on the Mac with "bad interpreter".
+$shText = Get-Content -Raw (Join-Path $stage "mac\scshr-macos-tunnel.sh")
+if ($shText.Contains("`r`n")) { throw "package.ps1: mac\scshr-macos-tunnel.sh has CRLF line endings" }
 
 $guide = Join-Path $root "docs\USER-GUIDE.md"
 if (Test-Path $guide) { Copy-Item $guide (Join-Path $stage "README.txt") -Force }
@@ -71,6 +79,18 @@ scshr bundles the following third-party components:
 
 $zip = Join-Path $stageRoot "scshr-$version-win64.zip"
 if (Test-Path $zip) { Remove-Item -Force $zip }
-Compress-Archive -Path (Join-Path $stage "*") -DestinationPath $zip -Force
+Compress-Archive -Path $stage -DestinationPath $zip -Force   # zip root = the scshr-<version>-win64 folder
+
+# SHA-256 of the zip and of every staged file, in the usual `sha256sum` layout.
+$sums = Join-Path $stageRoot "SHA256SUMS.txt"
+$items = @(Get-Item $zip) + @(Get-ChildItem -Recurse -File $stage)
+$lines = foreach ($item in $items) {
+  $h = (Get-FileHash $item.FullName -Algorithm SHA256).Hash.ToLower()
+  $name = $item.FullName.Substring($stageRoot.Length + 1) -replace '\\', '/'
+  "$h  $name"
+}
+$lines | Set-Content -Encoding ascii $sums
 
 Write-Host "packaged: $zip"
+Write-Host "unpacked: $stage"
+Write-Host "checksums: $sums"
