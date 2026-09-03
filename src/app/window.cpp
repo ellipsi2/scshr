@@ -20,9 +20,14 @@ Window::Window(const std::wstring& title, int cw, int ch, WindowEvents ev) : ev_
         wc.hCursor = LoadCursorW(nullptr, IDC_ARROW); wc.lpszClassName = CLASS_NAME; wc.hbrBackground = nullptr;
         RegisterClassExW(&wc); g_class_registered = true;
     }
+    // Per-monitor-aware frame metrics: plain AdjustWindowRect assumes 96 DPI, which under-sizes the client area at
+    // >100 % scaling — and a client smaller than the advertised size reads as a user resize to the dynamic-resolution
+    // logic. Size for the system DPI first (CW_USEDEFAULT lands on the primary monitor), then re-fit once the window
+    // exists and its real monitor DPI is known.
     RECT r{0, 0, cw, ch};
-    AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
+    AdjustWindowRectExForDpi(&r, WS_OVERLAPPEDWINDOW, FALSE, 0, GetDpiForSystem());
     hwnd_ = CreateWindowExW(0, CLASS_NAME, title.c_str(), WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top, nullptr, nullptr, GetModuleHandleW(nullptr), this);
+    if (client_size() != std::pair<int, int>{cw, ch}) set_client_size(cw, ch);
     ShowWindow(hwnd_, SW_SHOW);
 }
 
@@ -41,7 +46,7 @@ LRESULT Window::handle(UINT m, WPARAM w, LPARAM l) {
     case WM_SIZING:
         if (aspect_w_ > 0 && aspect_h_ > 0) {
             RECT* r = reinterpret_cast<RECT*>(l);
-            RECT frame{0, 0, 0, 0}; AdjustWindowRect(&frame, WS_OVERLAPPEDWINDOW, FALSE);
+            RECT frame{0, 0, 0, 0}; AdjustWindowRectExForDpi(&frame, WS_OVERLAPPEDWINDOW, FALSE, 0, GetDpiForWindow(hwnd_));
             const int fw = frame.right - frame.left, fh = frame.bottom - frame.top;
             int cw = r->right - r->left - fw, ch = r->bottom - r->top - fh;
             const double asp = double(aspect_w_) / double(aspect_h_);
@@ -111,7 +116,7 @@ void Window::run_message_pump_once() { MSG msg; while (PeekMessageW(&msg, nullpt
 std::pair<int, int> Window::client_size() const { RECT r; GetClientRect(hwnd_, &r); return {r.right - r.left, r.bottom - r.top}; }
 float Window::dpi_scale() const { return float(GetDpiForWindow(hwnd_)) / 96.0f; }
 void Window::set_title(const std::wstring& t) { SetWindowTextW(hwnd_, t.c_str()); }
-void Window::set_client_size(int w, int h) { RECT r{0, 0, w, h}; AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE); SetWindowPos(hwnd_, nullptr, 0, 0, r.right - r.left, r.bottom - r.top, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE); }
+void Window::set_client_size(int w, int h) { RECT r{0, 0, w, h}; AdjustWindowRectExForDpi(&r, WS_OVERLAPPEDWINDOW, FALSE, 0, GetDpiForWindow(hwnd_)); SetWindowPos(hwnd_, nullptr, 0, 0, r.right - r.left, r.bottom - r.top, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE); }
 void Window::lock_aspect(int w, int h) { aspect_w_ = w; aspect_h_ = h; }
 void Window::show_cursor(bool show) { cursor_hidden_ = !show; }
 bool Window::focused() const { return GetForegroundWindow() == hwnd_; }
