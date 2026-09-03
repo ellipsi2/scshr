@@ -32,8 +32,10 @@ needed. On the same network (same house or office Wi-Fi) nothing else is require
    network service for the private link). Click **Yes**.
 2. Fill in:
    * **Mac address** — the name or IP you use to reach the Mac (for example `my-mac.local`,
-     `192.168.1.20`, or `home.example.net`). Add `:port` only if Remote Login uses a non-standard port.
+     `192.168.1.20`, or `home.example.net`).
    * **Mac user name** and **password** of an administrator account on the Mac.
+   * If Remote Login on the Mac uses a port other than 22, tick **Advanced** and enter it in
+     **SSH port**. (Writing `my-mac.local:2222` in the address box works too.)
 3. Click **Set up** and wait. scshr connects to the Mac, installs its helper there, creates the
    private link on both sides, turns on Screen Sharing on the Mac, and tests everything.
    The password is used once and is not saved.
@@ -57,6 +59,12 @@ If setup reports a problem, the message tells you what to do. The most common on
 3. Type the Mac account's user name and password (this is the account you log in with on the Mac;
    tick **Remember password** if you like) and click **Connect**.
 4. The Mac's screen appears in a window. Resize the window and the Mac's screen follows.
+
+If somebody is sitting at the Mac, you normally get **your own separate session**: you sign in with your
+account, they keep their screen, and neither of you disturbs the other (the Mac needs macOS 14 or newer,
+and your account must not already be signed in at the Mac). If you would rather see and control the
+same screen as the person at the Mac, choose **Options…** and pick **Share their screen**; they then
+have to click **Allow** on the Mac.
 
 While connected:
 
@@ -95,6 +103,10 @@ boots.
 
 **Can two PCs share one Mac?** Not at the same time. Each PC needs its own setup, and setting up a
 second PC replaces the first.
+
+**Can I use the Mac while someone else is using it?** Yes. With the default *own separate session*
+option you sign in with your account and work in your own session; the person at the Mac keeps their
+screen, mouse and keyboard. Your account must be different from the one already signed in at the Mac.
 
 **Something else went wrong.** In the scshr window click **Check connection** and read the message.
 For deeper troubleshooting see `README.md` (technical) — the command line tools `scshr check` and

@@ -11,7 +11,7 @@ struct ViewerOptions {
     std::string host, user, password, log_file, advertise = "auto", hidpi = "auto", codec = "auto", decoder = "auto", present = "vsync", record, display = "all";
     std::string title_label;   // shown in the window title ("" → host)
     uint16_t port = 5900;
-    bool password_stdin = false, srp = true, hdr = false, curtain = true, share_console = false, alt_session = false, audio = true, verbose = false, quiet = false;
+    bool password_stdin = false, srp = true, hdr = false, curtain = true, share_console = false, alt_session = true, audio = true, verbose = false, quiet = false;
     std::optional<bool> dynamic;
     bool clipboard = true, grab = true, ltrp = true, legacy_cursor = false;
     int auto_quit = 0, adapter = -1, tiles = 0, stats_interval = 2;

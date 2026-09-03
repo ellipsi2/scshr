@@ -24,6 +24,8 @@
 #define IDC_SETUP_PROGRESS         1012
 #define IDC_SETUP_STATUS           1013
 #define IDC_SETUP_LOG              1014
+#define IDC_SETUP_SSH_PORT_LBL     1015
+#define IDC_SETUP_SSH_PORT         1016
 
 // ── connect page ──────────────────────────────────────────────────────────
 #define IDC_CONN_MAC               1100
@@ -42,6 +44,12 @@
 #define IDC_OPT_AUDIO              1200
 #define IDC_OPT_DISPLAY_LBL        1201
 #define IDC_OPT_DISPLAY            1202
+#define IDC_OPT_SESSION_LBL        1203
+#define IDC_OPT_SEPARATE           1204
+#define IDC_OPT_SHARED             1205
+#ifndef IDC_STATIC
+#define IDC_STATIC                 -1
+#endif
 
 // ── password prompt ───────────────────────────────────────────────────────
 #define IDC_PWD_TEXT               1300

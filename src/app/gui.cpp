@@ -89,6 +89,7 @@ INT_PTR CALLBACK options_proc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp) {
         ctx = reinterpret_cast<OptionsCtx*>(lp);
         apply_icon(dlg);
         CheckDlgButton(dlg, IDC_OPT_AUDIO, ctx->settings->audio ? BST_CHECKED : BST_UNCHECKED);
+        CheckRadioButton(dlg, IDC_OPT_SEPARATE, IDC_OPT_SHARED, ctx->settings->separate_session ? IDC_OPT_SEPARATE : IDC_OPT_SHARED);
         HWND cb = GetDlgItem(dlg, IDC_OPT_DISPLAY);
         SendMessageW(cb, CB_ADDSTRING, 0, LPARAM(L"All monitors, one window each"));
         SendMessageW(cb, CB_ADDSTRING, 0, LPARAM(L"Everything in one window"));
@@ -102,6 +103,7 @@ INT_PTR CALLBACK options_proc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_COMMAND:
         if (LOWORD(wp) == IDOK) {
             ctx->settings->audio = IsDlgButtonChecked(dlg, IDC_OPT_AUDIO) == BST_CHECKED;
+            ctx->settings->separate_session = IsDlgButtonChecked(dlg, IDC_OPT_SEPARATE) == BST_CHECKED;
             const int sel = int(SendDlgItemMessageW(dlg, IDC_OPT_DISPLAY, CB_GETCURSEL, 0, 0));
             ctx->settings->display = sel <= 0 ? "all" : sel == 1 ? "combined" : std::to_string(sel - 1);
             EndDialog(dlg, IDOK);
@@ -148,15 +150,22 @@ struct SetupCtx {
 };
 
 const int kSetupInputs[] = {IDC_SETUP_HOST, IDC_SETUP_USER, IDC_SETUP_PASS, IDC_SETUP_ADVANCED,
-                            IDC_SETUP_PORT, IDC_SETUP_ENDPOINT};
+                            IDC_SETUP_SSH_PORT, IDC_SETUP_PORT, IDC_SETUP_ENDPOINT};
 
 void setup_show_advanced(HWND dlg, bool on) {
-    const int ids[] = {IDC_SETUP_PORT_LBL, IDC_SETUP_PORT, IDC_SETUP_ENDPOINT_LBL, IDC_SETUP_ENDPOINT};
+    const int ids[] = {IDC_SETUP_SSH_PORT_LBL, IDC_SETUP_SSH_PORT, IDC_SETUP_PORT_LBL, IDC_SETUP_PORT,
+                       IDC_SETUP_ENDPOINT_LBL, IDC_SETUP_ENDPOINT};
     for (int id : ids) ShowWindow(GetDlgItem(dlg, id), on ? SW_SHOW : SW_HIDE);
 }
 
 void setup_enable_inputs(HWND dlg, bool on) {
     for (int id : kSetupInputs) EnableWindow(GetDlgItem(dlg, id), on);
+}
+
+// Reads a 1..65535 port from an edit control; returns 0 when the field is empty or out of range.
+uint16_t dlg_port(HWND dlg, int id) {
+    const long v = std::strtol(dlg_text(dlg, id).c_str(), nullptr, 10);
+    return v > 0 && v < 65536 ? uint16_t(v) : 0;
 }
 
 void setup_start(HWND dlg, SetupCtx& ctx) {
@@ -165,12 +174,33 @@ void setup_start(HWND dlg, SetupCtx& ctx) {
     req.ssh_user = dlg_text(dlg, IDC_SETUP_USER);
     req.password = dlg_text(dlg, IDC_SETUP_PASS);
     req.endpoint_override = ctx.advanced ? dlg_text(dlg, IDC_SETUP_ENDPOINT) : std::string();
-    const int port = ctx.advanced ? atoi(dlg_text(dlg, IDC_SETUP_PORT).c_str()) : 51820;
-    req.listen_port = uint16_t(port > 0 && port < 65536 ? port : 51820);
+    const uint16_t listen = ctx.advanced ? dlg_port(dlg, IDC_SETUP_PORT) : 0;
+    req.listen_port = listen ? listen : 51820;
     if (ctx.previous) req.expected_hostkey = ctx.previous->ssh_hostkey_sha256;
     if (req.ssh_host.empty() || req.ssh_user.empty() || req.password.empty()) {
         gui_message(L"Set up scshr", L"Fill in the Mac's address, a user name and that user's password.", true);
         return;
+    }
+    // The SSH port lives in the Advanced section, but "host:port" in the address box still works, so
+    // the two must agree. run_setup() re-parses req.ssh_host; hand it the composed form.
+    if (ctx.advanced) {
+        std::string host;
+        uint16_t typed_port = 22;
+        if (!parse_ssh_host(req.ssh_host, host, typed_port)) {
+            gui_message(L"Set up scshr", L"\"" + widen(req.ssh_host) + L"\" is not a valid Mac address.", true);
+            return;
+        }
+        const uint16_t ssh_port = dlg_port(dlg, IDC_SETUP_SSH_PORT);
+        if (!ssh_port) {
+            gui_message(L"Set up scshr", L"The SSH port must be a number from 1 to 65535 (22 is the usual one).", true);
+            return;
+        }
+        if (typed_port != 22 && ssh_port != 22 && typed_port != ssh_port) {
+            gui_message(L"Set up scshr", L"The Mac address says port " + std::to_wstring(typed_port) +
+                        L" but the SSH port field says " + std::to_wstring(ssh_port) + L". Use one or the other.", true);
+            return;
+        }
+        req.ssh_host = compose_ssh_host(host, ssh_port != 22 ? ssh_port : typed_port);
     }
     ctx.req = req;
     ctx.cancel = false;
@@ -251,10 +281,18 @@ INT_PTR CALLBACK setup_proc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp) {
         apply_icon(dlg);
         setup_show_advanced(dlg, false);
         ShowWindow(GetDlgItem(dlg, IDC_SETUP_PROGRESS), SW_HIDE);   // only meaningful once setup is running
+        SetDlgItemTextW(dlg, IDC_SETUP_SSH_PORT, L"22");
         SetDlgItemTextW(dlg, IDC_SETUP_PORT, L"51820");
         if (ctx->previous) {
-            set_text(dlg, IDC_SETUP_HOST, compose_ssh_host(ctx->previous->ssh_host, ctx->previous->ssh_port));
+            set_text(dlg, IDC_SETUP_HOST, ctx->previous->ssh_host);
             set_text(dlg, IDC_SETUP_USER, ctx->previous->ssh_user);
+            SetDlgItemTextW(dlg, IDC_SETUP_SSH_PORT, std::to_wstring(ctx->previous->ssh_port).c_str());
+            if (ctx->previous->ssh_port != 22) {
+                // A non-default port is worth seeing, not just carrying over silently.
+                CheckDlgButton(dlg, IDC_SETUP_ADVANCED, BST_CHECKED);
+                ctx->advanced = true;
+                setup_show_advanced(dlg, true);
+            }
         }
         SetFocus(GetDlgItem(dlg, ctx->previous ? IDC_SETUP_PASS : IDC_SETUP_HOST));
         return FALSE;
@@ -388,6 +426,8 @@ void connect_run_viewer(HWND dlg, ConnectCtx& ctx) {
     o.password = password;
     o.audio = ctx.settings.audio;
     o.display = ctx.settings.display;
+    o.alt_session = ctx.settings.separate_session;    // own virtual session (default) …
+    o.share_console = !o.alt_session;                 // … or the console user's screen after they click Allow
     o.title_label = label;
     o.direct = false;
     o.host.clear();

@@ -32,6 +32,7 @@ TEST(setup_settings_roundtrip) {
     s.remember_password = true;
     s.audio = false;
     s.display = "combined";
+    s.separate_session = false;
     s.paired = true;
 
     const std::string text = serialize_settings(s);
@@ -47,6 +48,7 @@ TEST(setup_settings_roundtrip) {
     CHECK_EQ(r.remember_password, true);
     CHECK_EQ(r.audio, false);
     CHECK_EQ(r.display, s.display);
+    CHECK_EQ(r.separate_session, false);
     CHECK_EQ(r.paired, true);
 }
 
@@ -68,6 +70,7 @@ TEST(setup_settings_tolerates_foreign_keys) {
     CHECK_EQ(r.paired, true);
     CHECK_EQ(r.ssh_port, uint16_t(22));
     CHECK_EQ(r.display, std::string("all"));   // untouched default
+    CHECK_EQ(r.separate_session, true);        // default: own session
 }
 
 TEST(setup_settings_bool_spellings) {

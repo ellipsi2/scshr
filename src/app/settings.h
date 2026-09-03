@@ -20,6 +20,7 @@ struct Settings {
     bool remember_password = false;   // Screen Sharing password kept in Credential Manager
     bool audio = true;
     std::string display = "all";      // "all" | "combined" | "<N>"
+    bool separate_session = true;     // log in to an own virtual session; false = share the console user's screen
     bool paired = false;              // set once the wizard completed end to end
 };
 

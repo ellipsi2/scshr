@@ -78,6 +78,13 @@ bool peek_ss_prompt(net::TcpSocket& sock) {
     return p.size() == 4 && std::memcmp(p.data(), SS_MAGIC, 4) == 0;
 }
 
+// The prompt's command mask (bit 0 = share the console session, bit 2 = own session); 0 if unreadable.
+uint32_t peek_ss_flags(net::TcpSocket& sock) {
+    Bytes p = sock.peek(8, 2.0);
+    if (p.size() < 8 || std::memcmp(p.data(), SS_MAGIC, 4) != 0) return 0;
+    return be32(p.data() + 4);
+}
+
 std::string peek_ss_console_user(net::TcpSocket& sock) {
     Bytes p = sock.peek(76, 2.0);
     if (p.size() < 0xd || std::memcmp(p.data(), SS_MAGIC, 4) != 0) return "";
@@ -245,6 +252,15 @@ Result connect_and_negotiate(const Params& pin) {
     bool alt = p.alt_session;
 
     if (peek_ss_prompt(sock)) {
+        if (alt) {
+            // A separate session is only offered when the account is not already at the console (and on
+            // hosts that support virtual sessions at all); otherwise share the console rather than fail.
+            const uint32_t flags = peek_ss_flags(sock);
+            if (flags && !((flags >> 2) & 1) && (flags & 1)) {
+                LOG_WARN("negotiation", "session-select: the Mac does not offer a separate session (mask 0x%x; is this account already logged in at the Mac?) — sharing the console session instead", flags);
+                alt = false;
+            }
+        }
         if (!alt && !p.share_console && p.on_session_choice) {
             const std::string cu = peek_ss_console_user(sock);
             std::string choice = "share_console";

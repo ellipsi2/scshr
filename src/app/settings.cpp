@@ -53,6 +53,7 @@ Settings parse_into(const std::string& text, int& recognised) {
         else if (k == "remember_password") hit = parse_bool(v, s.remember_password);
         else if (k == "audio") hit = parse_bool(v, s.audio);
         else if (k == "display") s.display = v;
+        else if (k == "separate_session") hit = parse_bool(v, s.separate_session);
         else if (k == "paired") hit = parse_bool(v, s.paired);
         else hit = false;   // unknown key: ignored so old builds tolerate new fields
         if (hit) ++recognised;
@@ -73,6 +74,7 @@ std::string serialize_settings(const Settings& s) {
     t += std::string("remember_password=") + (s.remember_password ? "1" : "0") + "\n";
     t += std::string("audio=") + (s.audio ? "1" : "0") + "\n";
     t += "display=" + s.display + "\n";
+    t += std::string("separate_session=") + (s.separate_session ? "1" : "0") + "\n";
     t += std::string("paired=") + (s.paired ? "1" : "0") + "\n";
     return t;
 }

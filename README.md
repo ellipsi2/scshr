@@ -81,7 +81,8 @@ tunnel for development and replay work only.
 
 Options mirror the Python `iss` CLI: `--advertise WxH[@SCALE]|auto`, `--hidpi auto|on|off|N`,
 `--dynamic/--no-dynamic`, `--codec auto|hevc|avc`, `--decoder auto|sw`, `--curtain/--no-curtain`,
-`--share-console`, `--alt-session`, `--audio/--no-audio`, `--display N|all|combined`, `--record FILE.scshr`,
+`--alt-session` (default: own virtual session; falls back to the console session when the host offers none) /
+`--share-console`, `--audio/--no-audio`, `--display N|all|combined`, `--record FILE.scshr`,
 `--auto-quit-secs N`, `--stats-interval S`, `-v`, `--log-file PATH`. Added here: `--direct --host H`
 (bypass the tunnel; development only) and the `setup` / `check` / `unpair` / `init` / `status` / `tunnel uninstall`
 subcommands.
@@ -111,6 +112,7 @@ WASAPI shared mode with a 40 ms jitter target. Without the DLL video runs and au
 | `scshr_sender` | real-time UDP replay of a recording with emulated one-way delay / jitter / loss |
 | `scshr --replay-key HEX` | full viewer fed by `scshr_sender` (no TCP handshake) — the end-to-end performance harness |
 | `scshr_bench` | packet-path throughput microbenchmark |
+| `scshr_inputprobe` | connects a real session (no window) and injects synthetic pointer/key events so the host side can be watched with `log stream` — the tool that caught the dropped-control-message bug |
 | `tools/e2e.sh` | one-shot viewer + sender run with summary lines |
 | `tools/scshr-macos-tunnel.sh` | macOS identity/pairing/lifecycle + mandatory Screen Sharing PF isolation (bash 3.2, no Homebrew) |
 | `tools/mac-tunnel/` | Go: self-contained macOS tunnel daemon (wireguard-go) + keys/status, cross-compiled into `mac/` |

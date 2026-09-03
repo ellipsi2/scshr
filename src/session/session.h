@@ -151,6 +151,7 @@ private:
     // tx
     void send_heartbeat();
     void send_rr_and_maybe_sr();
+    void send_rr(const std::vector<uint32_t>& sources, const std::map<uint32_t, rtcp::SsrcStat>& stats);
     void drain_pending_fir(int64_t now);
     bool send_fir_for_tile(int tile, int64_t now, bool record_grayout = true);
     void drain_pending_nack();

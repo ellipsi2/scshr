@@ -249,12 +249,32 @@ InitialBurst Session::negotiate_and_burst() {
     const double max_s = is_avc ? 4.0 : 2.0;
     const size_t min_packets = is_avc ? 400 : 100;
     std::vector<std::pair<Bytes, int64_t>> raw;
-    const int64_t deadline = now_ns() + int64_t(max_s * 1e9);
+    const int64_t drain_start = now_ns();
+    const int64_t deadline = drain_start + int64_t(max_s * 1e9);
     std::vector<uint8_t> buf(65536);
     int64_t settle_deadline = 0;
+    // The Mac drops the stream (and, in curtain/alt-session mode, the virtual display it was
+    // capturing) when no RTCP arrives within ~3 s of starting it. The tx thread that normally sends
+    // receiver reports only starts after this drain, which can last the whole 4 s on a static
+    // screen — so report from here, every TX_INTERVAL, on whatever SSRCs the burst has shown so far.
+    std::vector<uint32_t> early_sources; std::map<uint32_t, rtcp::SsrcStat> early_stats;
+    int64_t next_rr = drain_start; int early_rr_count = 0;
     while (now_ns() < deadline) {
+        if (now_ns() >= next_rr) {
+            send_rr(early_sources, early_stats);
+            if (++early_rr_count == 1) LOG_INFO("session", "early RTCP RR sent %.0f ms into the burst drain (%zu source(s))", double(now_ns() - drain_start) / 1e6, early_sources.size());
+            next_rr += TX_INTERVAL_NS;
+        }
         const int n = sock_video_.recv(buf.data(), buf.size(), 50);
-        if (n > 0) { raw.emplace_back(Bytes(buf.begin(), buf.begin() + n), now_ns()); write_record(0, buf.data(), size_t(n), raw.back().second); }
+        if (n > 0) {
+            raw.emplace_back(Bytes(buf.begin(), buf.begin() + n), now_ns()); write_record(0, buf.data(), size_t(n), raw.back().second);
+            if (n >= 12 && (buf[0] & 0xC0) == 0x80) {   // RTP v2: note the sender SSRC and its latest sequence number
+                const uint32_t ssrc = be32(buf.data() + 8); const uint16_t seq = be16(buf.data() + 2);
+                auto it = early_stats.find(ssrc);
+                if (it == early_stats.end()) { early_sources.push_back(ssrc); early_stats[ssrc] = {seq, 0}; }
+                else if (int16_t(seq - it->second.max_seq) > 0) it->second.max_seq = seq;
+            }
+        }
         else if (n == 0 && !raw.empty()) {
             // burst.py: wait until min_packets (or deadline), then settle 300 ms
             if (raw.size() >= min_packets) { if (!settle_deadline) settle_deadline = now_ns() + 300'000'000; if (now_ns() >= settle_deadline) break; }
@@ -550,7 +570,10 @@ void Session::handle_tcp_msg(ByteView msg) {
     const uint8_t t = msg[0];
     if (t == 0x14) {
         const int cmd = msg.size() >= 8 ? be16(msg.data() + 6) : -1;
-        if (cmd != last_misc_cmd_) { LOG_DEBUG("session", "server sent 0x14 misc-status (cmd=%d)", cmd); last_misc_cmd_ = cmd; }
+        if (cmd == 11) LOG_INFO("session", "server 0x14 misc-status cmd=11 (UserSessionChanged): the Mac's session set changed under this connection");
+        else if (cmd == 4) LOG_INFO("session", "server 0x14 misc-status cmd=4 (undocumented; observed around capture-display reconfiguration)");
+        else if (cmd != last_misc_cmd_) LOG_DEBUG("session", "server sent 0x14 misc-status (cmd=%d)", cmd);
+        last_misc_cmd_ = cmd;
         if (cmd == 2 && cfg_.clipboard) { LOG_INFO("session", "remote clipboard changed; sending fetch (0x0b)"); send_ctrl(view(clip::build_clipboard_request(false))); }
         return;
     }
@@ -586,10 +609,21 @@ void Session::handle_fbu(ByteView msg) {
             bool needs_arm = false;
             if (layout) {
                 bool changed_rects = false;
-                { std::lock_guard<std::mutex> lk(dims_mu_); if (layout->rects != display_rects_) { display_rects_ = layout->rects; changed_rects = true; } }
+                std::vector<rfb::DisplayRect> prev;
+                { std::lock_guard<std::mutex> lk(dims_mu_); if (layout->rects != display_rects_) { prev = display_rects_; display_rects_ = layout->rects; changed_rects = true; } }
                 if (changed_rects) {
+                    const auto ids_of = [](const std::vector<rfb::DisplayRect>& v) { std::string s; for (auto& r : v) { char b[16]; snprintf(b, sizeof b, "#%u ", r.display_id); s += b; } return s; };
                     std::string s; for (auto& r : layout->rects) { char b[64]; snprintf(b, sizeof b, "#%u@%d,%d %dx%d ", r.display_id, r.x, r.y, r.w, r.h); s += b; }
                     LOG_INFO("session", "AppleDisplayLayout: %zu display(s): %s", layout->rects.size(), s.c_str());
+                    // A different set of display ids mid-session means the Mac replaced what it captures. In
+                    // curtain / alt-session mode that is the virtual display being torn down (seen after an RTCP
+                    // timeout): the stream then carries the physical console, i.e. someone else's screen.
+                    if (!prev.empty() && ids_of(prev) != ids_of(layout->rects)) {
+                        const bool physical = layout->scaled_w == server_w_ && layout->scaled_h == server_h_;
+                        LOG_WARN("session", "capture display CHANGED: %s-> %s(%s)", ids_of(prev).c_str(), ids_of(layout->rects).c_str(),
+                                 physical ? "geometry now equals the ServerInit physical display — the Mac tore down the virtual display and is streaming the console"
+                                          : "the Mac replaced the display it captures");
+                    }
                 }
             }
             // Geometry header lives INSIDE the payload (after the u16 prefix): ver, scaled_w/h, backing_w/h.
@@ -727,6 +761,11 @@ void Session::send_rr_and_maybe_sr() {
     if (!srtcp_enc_ || !our_video_ssrc_) return;
     std::vector<uint32_t> sources; std::map<uint32_t, rtcp::SsrcStat> stats;
     for (auto& kv : ssrc_to_tile_) { sources.push_back(kv.first); auto it = assembler_->seq_state().find(kv.first); if (it != assembler_->seq_state().end()) stats[kv.first] = {it->second.max_seq, it->second.roc}; }
+    send_rr(sources, stats);
+}
+
+void Session::send_rr(const std::vector<uint32_t>& sources, const std::map<uint32_t, rtcp::SsrcStat>& stats) {
+    if (!srtcp_enc_ || !our_video_ssrc_) return;
     std::map<uint32_t, rtcp::SrArrival> sr; { std::lock_guard<std::mutex> lk(sr_mu_); sr = server_sr_; }
     Bytes rr = rtcp::build_rr(*our_video_ssrc_, sources, stats, sr);
     if (tx_tick_ % RTCP_SR_EVERY_N_TICKS == 0) { Bytes s = rtcp::build_empty_sr(*our_video_ssrc_); s.insert(s.end(), rr.begin(), rr.end()); rr = s; }

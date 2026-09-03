@@ -92,7 +92,7 @@ void usage() {
               "    sessions run over the paired scshr WireGuard tunnel; --direct --host H bypasses it (development only)\n"
               "  --advertise WxH[@SCALE]|auto   --hidpi auto|on|off|N   --dynamic / --no-dynamic   --hdr\n"
               "  --codec auto|hevc|avc   --decoder auto|sw   --tiles N   --no-ltrp\n"
-              "  --curtain / --no-curtain   --share-console   --alt-session   --audio / --no-audio\n"
+              "  --curtain / --no-curtain   --alt-session (default: own virtual session) / --share-console   --audio / --no-audio\n"
               "  --present vsync|lowlat   --adapter N   --list-adapters   --display N|all|combined\n"
               "  --record FILE.scshr   --auto-quit-secs N   --stats-interval S   --no-clipboard   --no-grab\n"
               "  --drop-pct P (synthetic loss)   --headless   -v   -q   --log-file PATH");
@@ -110,7 +110,7 @@ bool parse_viewer_args(int argc, char** argv, ViewerOptions& a) {
         else if (k == "--hdr") a.hdr = true; else if (k == "--codec") a.codec = need(i); else if (k == "--decoder") a.decoder = need(i);
         else if (k == "--tiles") a.tiles = atoi(need(i).c_str()); else if (k == "--no-ltrp") a.ltrp = false;
         else if (k == "--curtain") a.curtain = true; else if (k == "--no-curtain") a.curtain = false;
-        else if (k == "--share-console") a.share_console = true; else if (k == "--alt-session") a.alt_session = true;
+        else if (k == "--share-console") { a.share_console = true; a.alt_session = false; } else if (k == "--alt-session") { a.alt_session = true; a.share_console = false; }
         else if (k == "--audio") a.audio = true; else if (k == "--no-audio") a.audio = false;
         else if (k == "--present") a.present = need(i); else if (k == "--adapter") a.adapter = atoi(need(i).c_str()); else if (k == "--list-adapters") a.list_adapters = true;
         else if (k == "--display") a.display = need(i); else if (k == "--record") a.record = need(i);
