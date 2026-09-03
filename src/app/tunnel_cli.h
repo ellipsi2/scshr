@@ -1,0 +1,17 @@
+#pragma once
+// `scshr init` / `scshr status` / `scshr tunnel …` and the fail-closed session preflight.
+#include <string>
+
+namespace scshr::app {
+
+// Returns true if argv[1] named a tunnel subcommand; `exit_code` then holds the process result.
+bool run_tunnel_command(int argc, char** argv, int& exit_code);
+
+// Resolves the address a production session must use.
+//   direct == true  → `host` is returned unchanged (development / replay only)
+//   direct == false → the peer's tunnel address, after verifying the tunnel is installed,
+//                     running, correctly routed and bound to the expected peer identity.
+// Throws std::runtime_error (fail closed) rather than falling back to a public address.
+std::string resolve_session_host(const std::string& requested_host, bool direct);
+
+}  // namespace scshr::app

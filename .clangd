@@ -1,0 +1,2 @@
+CompileFlags:
+  Add: [-std=c++20, -IG:/Dev/scshr/src, -IG:/Dev/scshr/third_party/ffmpeg/include, "-IC:/Program Files/OpenSSL-Win64/include", -IG:/Dev/scshr/third_party/miniz, -DWIN32_LEAN_AND_MEAN, -DNOMINMAX, -DUNICODE, -D_UNICODE]
