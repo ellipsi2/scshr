@@ -188,6 +188,13 @@ int cmd_init(int argc, char** argv) {
 }
 
 int cmd_status() {
+    // The pairing state and the WireGuard driver are readable only by SYSTEM and Administrators,
+    // so an unelevated console cannot tell "not configured" from "not allowed to look".
+    if (!is_elevated()) {
+        std::puts("scshr tunnel: status needs Administrator (the pairing state and the WireGuard\n"
+                  "             driver are restricted to SYSTEM and Administrators)");
+        return 1;
+    }
     const auto state = load_state();
     if (!state) {
         std::puts("scshr tunnel: not configured (run `scshr init`)");
@@ -266,6 +273,13 @@ std::string resolve_session_host(const std::string& requested_host, bool direct)
         LOG_WARN("tunnel", "--direct: bypassing the scshr tunnel (development mode; never a production fallback)");
         return requested_host;
     }
+    // Verifying the live tunnel (peer key, AllowedIPs) means querying the WireGuard driver, which
+    // only Administrators may open — so a production session cannot run unelevated at all.
+    if (!is_elevated())
+        throw std::runtime_error("a tunnel session needs Administrator: verifying the paired peer requires the "
+                                 "WireGuard driver and the pairing state, both restricted to SYSTEM and "
+                                 "Administrators — start scshr from an elevated console (or pass --direct for a "
+                                 "development session)");
     const auto state = load_state();
     if (!state) throw std::runtime_error("scshr tunnel is not configured — run `scshr init` (or pass --direct for a development session)");
     if (!requested_host.empty() && requested_host != state->mac_ip)

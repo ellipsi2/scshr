@@ -100,6 +100,9 @@ below the socket layer and the media hot path (IOCP → SRTP → RTP → D3D11VA
 
 ## Status and removal
 
+`status` and production sessions read Administrator-only state (`%ProgramData%\scshr`, ACL'd to
+SYSTEM + Administrators) and query the WireGuardNT driver, so both need an elevated console.
+
 ```powershell
 .\scshr.exe status                              # state, addresses, endpoint, key fingerprints,
                                                 # handshake age, byte counters, route validation

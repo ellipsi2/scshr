@@ -1,5 +1,5 @@
 #pragma once
-// WireGuard configuration rendering + UAPI status parsing for the scshr tunnel.
+// WireGuard configuration rendering for the scshr tunnel.
 //
 // Rendering is deterministic (same inputs → byte-identical file) so `scshr init` can be idempotent:
 // it rewrites the tunnel only when the rendered text actually differs from what is on disk.
@@ -30,21 +30,17 @@ std::string describe_windows_conf(const WindowsTunnelConfig& c);
 // Short, stable, non-secret identifier for a public key: first 16 hex digits of SHA-256(key bytes).
 std::string key_fingerprint(const std::string& public_key_b64);
 
-// ── UAPI ("get=1") status ─────────────────────────────────────────────────────────────────
+// ── live tunnel status (read from the WireGuardNT driver by win_tunnel.cpp) ────────────────
 struct TunnelStatus {
     bool valid = false;
     std::string interface_public_key;
     uint16_t listen_port = 0;
     std::string peer_public_key;
     std::string endpoint;             // as reported by the driver, "ip:port"
-    std::string allowed_ip;           // first allowed_ip line of the peer
+    std::string allowed_ip;           // the peer's first allowed IP, "ip/cidr"
     uint64_t rx_bytes = 0, tx_bytes = 0;
     int64_t last_handshake_unix = 0;  // 0 = never
     uint16_t persistent_keepalive = 0;
 };
-
-// Parses the wg userspace-API response. Never stores private key material: a private_key line is
-// consumed and discarded. Returns false with a reason if the response is malformed or errno != 0.
-bool parse_uapi_status(const std::string& response, TunnelStatus& out, std::string& error);
 
 }  // namespace scshr::tunnel

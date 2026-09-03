@@ -101,6 +101,8 @@ target_link_libraries(scshr_media PUBLIC scshr_core ffmpeg::avcodec ffmpeg::avut
 add_executable(scshr src/app/main.cpp src/app/window.cpp src/app/input.cpp src/app/keyboard_hook.cpp src/app/local_clipboard.cpp
                src/app/tunnel_cli.cpp src/tunnel/win_tunnel.cpp)
 target_link_libraries(scshr PRIVATE scshr_media shell32 shcore winmm iphlpapi crypt32 advapi32)
+# WireGuardNT's adapter API header: status is read from the driver, not a userspace-API pipe.
+target_include_directories(scshr PRIVATE "${CMAKE_SOURCE_DIR}/third_party/wireguard")
 
 # Bundled WireGuard components (pinned; see third_party/README.md). Copied next to scshr.exe so the
 # tunnel service can load them from the executable directory.

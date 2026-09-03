@@ -6,34 +6,6 @@
 #include <stdexcept>
 
 namespace scshr::tunnel {
-namespace {
-
-std::string hex_to_raw(const std::string& h) {
-    if (h.size() % 2 || h.empty()) return {};
-    std::string out;
-    out.reserve(h.size() / 2);
-    for (size_t i = 0; i < h.size(); i += 2) {
-        auto nib = [](char c) -> int {
-            if (c >= '0' && c <= '9') return c - '0';
-            if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-            if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-            return -1;
-        };
-        const int a = nib(h[i]), b = nib(h[i + 1]);
-        if (a < 0 || b < 0) return {};
-        out.push_back(char(a * 16 + b));
-    }
-    return out;
-}
-
-// UAPI spells keys in hex; the config file and the pairing descriptors spell them in base64.
-std::string key_hex_to_b64(const std::string& hex) {
-    const std::string raw = hex_to_raw(hex);
-    if (raw.size() != 32) return {};
-    return base64_std_encode(raw);
-}
-
-}  // namespace
 
 std::string render_windows_conf(const WindowsTunnelConfig& c) {
     if (!valid_wg_key(c.private_key)) throw std::invalid_argument("tunnel config: invalid local private key");
@@ -73,55 +45,6 @@ std::string key_fingerprint(const std::string& public_key_b64) {
     if (!wg_key_bytes(public_key_b64, raw)) return "<invalid>";
     const auto d = crypto::sha256(ByteView(reinterpret_cast<const uint8_t*>(raw.data()), raw.size()));
     return hex(ByteView(d.data(), 8));
-}
-
-bool parse_uapi_status(const std::string& response, TunnelStatus& out, std::string& error) {
-    TunnelStatus st;
-    bool saw_errno = false;
-    int64_t hs_sec = 0;
-    size_t pos = 0;
-    while (pos < response.size()) {
-        size_t nl = response.find('\n', pos);
-        if (nl == std::string::npos) nl = response.size();
-        std::string line = response.substr(pos, nl - pos);
-        pos = nl + 1;
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        if (line.empty()) continue;
-        const size_t eq = line.find('=');
-        if (eq == std::string::npos) { error = "malformed UAPI line"; return false; }
-        const std::string k = line.substr(0, eq), v = line.substr(eq + 1);
-        if (k == "private_key") continue;                       // never retained
-        if (k == "public_key") {
-            // The first public_key belongs to the interface; every later one starts a peer section.
-            const std::string b64 = key_hex_to_b64(v);
-            if (b64.empty()) { error = "malformed public_key"; return false; }
-            if (st.interface_public_key.empty()) st.interface_public_key = b64;
-            else if (st.peer_public_key.empty()) st.peer_public_key = b64;
-        } else if (k == "listen_port") {
-            st.listen_port = uint16_t(std::strtoul(v.c_str(), nullptr, 10));
-        } else if (k == "endpoint" && st.endpoint.empty()) {
-            st.endpoint = v;
-        } else if (k == "allowed_ip" && st.allowed_ip.empty()) {
-            st.allowed_ip = v;
-        } else if (k == "rx_bytes") {
-            st.rx_bytes = std::strtoull(v.c_str(), nullptr, 10);
-        } else if (k == "tx_bytes") {
-            st.tx_bytes = std::strtoull(v.c_str(), nullptr, 10);
-        } else if (k == "last_handshake_time_sec") {
-            hs_sec = int64_t(std::strtoll(v.c_str(), nullptr, 10));
-        } else if (k == "persistent_keepalive_interval") {
-            st.persistent_keepalive = uint16_t(std::strtoul(v.c_str(), nullptr, 10));
-        } else if (k == "errno") {
-            saw_errno = true;
-            if (v != "0") { error = "wireguard reported errno=" + v; return false; }
-        }
-    }
-    if (!saw_errno) { error = "truncated UAPI response"; return false; }
-    st.last_handshake_unix = hs_sec;
-    st.valid = true;
-    out = st;
-    error.clear();
-    return true;
 }
 
 }  // namespace scshr::tunnel

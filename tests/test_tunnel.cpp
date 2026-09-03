@@ -220,41 +220,6 @@ TEST(tunnel_windows_config_rejects_bad_input) {
     { auto c = base; c.win_ip = "10.99.0.2"; CHECK(throws(c)); }
 }
 
-TEST(tunnel_status_parsing) {
-    const std::string resp =
-        "private_key=e8b1cd0a4bd9de89b2f9f1e6f9de1b8c1f2a3b4c5d6e7f8091a2b3c4d5e6f708\n"
-        "public_key=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f\n"
-        "listen_port=51820\n"
-        "public_key=030a11181f262d343b424950575e656c737a81888f969da4abb2b9c0c7ced5dc\n"
-        "endpoint=203.0.113.7:51820\n"
-        "allowed_ip=10.77.77.1/32\n"
-        "last_handshake_time_sec=1700000000\n"
-        "last_handshake_time_nsec=250000000\n"
-        "persistent_keepalive_interval=25\n"
-        "rx_bytes=4096\n"
-        "tx_bytes=8192\n"
-        "errno=0\n\n";
-    TunnelStatus st;
-    std::string err;
-    CHECK(parse_uapi_status(resp, st, err));
-    CHECK(st.valid);
-    CHECK_EQ(st.interface_public_key, kMacPub);
-    CHECK_EQ(st.peer_public_key, kWinPub);
-    CHECK_EQ(int(st.listen_port), 51820);
-    CHECK_EQ(st.endpoint, std::string("203.0.113.7:51820"));
-    CHECK_EQ(st.allowed_ip, std::string("10.77.77.1/32"));
-    CHECK_EQ(st.rx_bytes, uint64_t(4096));
-    CHECK_EQ(st.tx_bytes, uint64_t(8192));
-    CHECK_EQ(st.last_handshake_unix, int64_t(1700000000));
-    CHECK_EQ(int(st.persistent_keepalive), 25);
-
-    TunnelStatus bad;
-    CHECK(!parse_uapi_status("errno=1\n\n", bad, err));
-    CHECK(!parse_uapi_status("public_key=00\nerrno=0\n\n", bad, err));      // short key
-    CHECK(!parse_uapi_status("listen_port=51820\n", bad, err));             // truncated, no errno
-    CHECK(!parse_uapi_status("garbage\nerrno=0\n\n", bad, err));            // no '='
-}
-
 TEST(tunnel_secret_redaction) {
     const std::string conf =
         "[Interface]\nPrivateKey = " + kWinPub + "\nAddress = 10.77.77.2/32\n"

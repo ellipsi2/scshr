@@ -55,13 +55,30 @@ b64url_decode() {
 need_root() { [ "$(id -u)" = "0" ] || die "this command must run as root (use sudo)"; }
 
 # Locates a supported WireGuard implementation. Homebrew installs under /usr/local or /opt/homebrew.
+# Upstream wg-quick requires bash 4+, which macOS does not ship (stock /bin/bash is 3.2), and its
+# `#!/usr/bin/env bash` picks up whatever bash comes first on PATH — so resolve a bash 4+ here and
+# invoke wg-quick through it explicitly instead of depending on PATH ordering.
 find_wireguard() {
     local extra="/opt/homebrew/bin:/usr/local/bin:/usr/local/sbin:/opt/homebrew/sbin"
     PATH="${extra}:${PATH}"
     export PATH
     command -v wg >/dev/null 2>&1 || die "wg not found — install WireGuard tools (brew install wireguard-tools)"
-    command -v wg-quick >/dev/null 2>&1 || die "wg-quick not found — install WireGuard tools (brew install wireguard-tools)"
+    WG_QUICK_PATH="$(command -v wg-quick 2>/dev/null || true)"
+    [ -n "$WG_QUICK_PATH" ] || die "wg-quick not found — install WireGuard tools (brew install wireguard-tools)"
+    local candidate
+    BASH4=""
+    for candidate in "$(command -v bash)" /opt/homebrew/bin/bash /usr/local/bin/bash; do
+        [ -n "$candidate" ] && [ -x "$candidate" ] || continue
+        case "$("$candidate" -c 'printf %s "${BASH_VERSINFO[0]}"' 2>/dev/null)" in
+            ''|[0-3]) ;;
+            *) BASH4="$candidate"; break ;;
+        esac
+    done
+    [ -n "$BASH4" ] || die "wg-quick requires bash 4+ but only bash ${BASH_VERSINFO[0]} was found — brew install bash"
 }
+
+# Every wg-quick invocation goes through the resolved bash 4+; find_wireguard runs first.
+wgq() { "$BASH4" "$WG_QUICK_PATH" "$@"; }
 
 is_wg_key() { printf '%s' "$1" | grep -Eq '^[A-Za-z0-9+/]{42}[A-Za-z0-9+/=]=$'; }
 
@@ -150,7 +167,9 @@ decode_client_code() {
     esac
     local payload="${code#SCCL1:}"
     [ -n "$payload" ] || die "empty pairing descriptor"
-    [ "${#payload}" -le 1024 ] && printf '%s' "$payload" | grep -Eq '^[A-Za-z0-9_-]+$' || die "invalid base64url payload"
+    # The bound is checked separately: BSD grep rejects ERE repetition counts above 255.
+    [ "${#payload}" -le 1024 ] || die "pairing descriptor too long"
+    printf '%s' "$payload" | grep -Eq '^[A-Za-z0-9_-]+$' || die "invalid base64url payload"
     body="$(printf '%s' "$payload" | b64url_decode)" || die "invalid base64url payload"
     [ "$(printf '%s' "$body" | wc -l | tr -d ' ')" = "1" ] || die "malformed pairing descriptor"
     WIN_PUB="$(printf '%s' "$body" | sed -n '1s/^k=//p')"
@@ -209,26 +228,31 @@ ensure_identity() {
 
 # ── configuration ─────────────────────────────────────────────────────────────────────────────
 write_conf() {   # rewrites $CONF from the stored identity + settings; only when the bytes differ
-    local peer_pub peer_ip staged
+    local peer_pub peer_ip staged_dir staged
     peer_pub="$(setting peer_public_key)"
     peer_ip="$(setting win_ip "$DEFAULT_WIN_IP")"
-    staged="$(mktemp)"
+    # wg-quick insists the file it parses is named "<interface>.conf", so stage under that exact
+    # name inside a private temporary directory rather than at a bare mktemp path.
+    staged_dir="$(mktemp -d)"
+    staged="${staged_dir}/${TUNNEL_NAME}.conf"
     if [ -n "$peer_pub" ]; then
         render_conf "$(cat "$PRIV_KEY")" "$(setting mac_ip "$DEFAULT_MAC_IP")" "$(setting listen_port "$DEFAULT_LISTEN_PORT")" "$peer_pub" "$peer_ip" >"$staged"
     else
         render_conf "$(cat "$PRIV_KEY")" "$(setting mac_ip "$DEFAULT_MAC_IP")" "$(setting listen_port "$DEFAULT_LISTEN_PORT")" >"$staged"
     fi
+    chmod 600 "$staged"
     # Validate before anything persistent changes: wg parses the [Interface]/[Peer] stanzas itself.
-    if ! wg-quick strip "$staged" >/dev/null 2>&1; then
-        rm -f "$staged"
-        die "generated WireGuard configuration failed validation"
+    local verdict
+    if ! verdict="$(wgq strip "$staged" 2>&1 >/dev/null)"; then
+        rm -rf "$staged_dir"
+        die "generated WireGuard configuration failed validation: ${verdict:-no output from wg-quick}"
     fi
     if [ -f "$CONF" ] && cmp -s "$staged" "$CONF"; then
-        rm -f "$staged"
+        rm -rf "$staged_dir"
         return 1
     fi
-    chmod 600 "$staged"
     mv -f "$staged" "$CONF"
+    rmdir "$staged_dir" 2>/dev/null || true
     chown root:wheel "$CONF"
     return 0
 }
@@ -331,14 +355,14 @@ cmd_up() {
     find_wireguard
     [ -f "$CONF" ] || die "not initialised — run 'init' first"
     pfctl -E -f "$PF_CONF" >/dev/null 2>&1 || die "could not activate PF — refusing to start the tunnel with Screen Sharing exposed"
-    tunnel_is_up || wg-quick up "$CONF"
+    tunnel_is_up || wgq up "$CONF"
     info "tunnel up: $(setting mac_ip "$DEFAULT_MAC_IP")/32 listening on udp/$(setting listen_port "$DEFAULT_LISTEN_PORT")"
 }
 
 cmd_down() {
     need_root
     find_wireguard
-    if tunnel_is_up; then wg-quick down "$CONF"; fi
+    if tunnel_is_up; then wgq down "$CONF"; fi
     # PF rules stay in place: taking the tunnel down must not re-expose Screen Sharing.
     info "tunnel down (Screen Sharing isolation remains active)"
 }
@@ -370,8 +394,8 @@ cmd_init() {
     if write_conf; then info "configuration written to ${CONF}"; else info "configuration already current"; fi
     install_pf
     install_launchd
-    if tunnel_is_up; then wg-quick down "$CONF" >/dev/null 2>&1 || true; fi
-    wg-quick up "$CONF"
+    if tunnel_is_up; then wgq down "$CONF" >/dev/null 2>&1 || true; fi
+    wgq up "$CONF"
 
     if [ "$(sysctl -n net.inet.ip.forwarding 2>/dev/null || echo 0)" != "0" ]; then
         info "NOTE: IP forwarding is enabled on this Mac by something else — scshr did not enable it and does not need it"
@@ -398,8 +422,8 @@ cmd_pair() {
     save_settings "$(setting endpoint)" "$(setting listen_port "$DEFAULT_LISTEN_PORT")" \
                   "$(setting mac_ip "$DEFAULT_MAC_IP")" "$WIN_IP" "$WIN_PUB"
     if write_conf; then
-        if tunnel_is_up; then wg-quick down "$CONF"; fi
-        wg-quick up "$CONF"
+        if tunnel_is_up; then wgq down "$CONF"; fi
+        wgq up "$CONF"
         info "paired with Windows peer $(printf '%s' "$WIN_PUB" | cut -c1-8)… at ${WIN_IP}/32"
     else
         info "already paired with this peer"
@@ -440,7 +464,7 @@ cmd_uninstall() {
     done
     need_root
     find_wireguard
-    if tunnel_is_up; then wg-quick down "$CONF" >/dev/null 2>&1 || true; fi
+    if tunnel_is_up; then wgq down "$CONF" >/dev/null 2>&1 || true; fi
     if [ -f "$LAUNCHD_PLIST" ]; then
         launchctl unload "$LAUNCHD_PLIST" >/dev/null 2>&1 || true
         rm -f "$LAUNCHD_PLIST"

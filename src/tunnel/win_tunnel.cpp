@@ -14,10 +14,14 @@
 #include <shellapi.h>
 #include <shlobj.h>
 
+#include "wireguard.h"   // WireGuardNT 1.1 adapter API (third_party/wireguard)
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
+#include <string>
+#include <vector>
 
 #pragma comment(lib, "iphlpapi.lib")
 
@@ -29,7 +33,6 @@ namespace {
 constexpr const wchar_t* kSecureSddl = L"D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
 constexpr const wchar_t* kServiceName = L"WireGuardTunnel$scshr";
 constexpr const wchar_t* kServiceDisplay = L"scshr WireGuard Tunnel";
-constexpr const wchar_t* kUapiPipe = L"\\\\.\\pipe\\ProtectedPrefix\\Administrators\\WireGuard\\scshr";
 
 [[noreturn]] void fail(const std::string& what, DWORD err = GetLastError()) {
     char buf[256] = {};
@@ -263,17 +266,19 @@ Components validate_components() {
 }
 
 KeyPair generate_keypair(const Components& c) {
-    HMODULE lib = LoadLibraryW(c.tunnel_dll.c_str());
+    // tunnel.dll is a Go DLL: its runtime spawns threads that outlive any exported call, so the
+    // module is loaded once and deliberately never unloaded. FreeLibrary here unmaps code those
+    // threads are still executing, which faults at an unpredictable point later in the process.
+    static HMODULE lib = LoadLibraryW(c.tunnel_dll.c_str());
     if (!lib) fail("loading tunnel.dll failed");
     using GenFn = void(__cdecl*)(BYTE*, BYTE*);
     auto gen = reinterpret_cast<GenFn>(reinterpret_cast<void*>(GetProcAddress(lib, "WireGuardGenerateKeypair")));
-    if (!gen) { FreeLibrary(lib); throw std::runtime_error("tunnel.dll does not export WireGuardGenerateKeypair"); }
+    if (!gen) throw std::runtime_error("tunnel.dll does not export WireGuardGenerateKeypair");
     BYTE pub[32] = {}, priv[32] = {};
     gen(pub, priv);
     KeyPair kp{base64_std_encode(std::string(reinterpret_cast<char*>(pub), 32)),
                base64_std_encode(std::string(reinterpret_cast<char*>(priv), 32))};
     SecureZeroMemory(priv, sizeof priv);
-    FreeLibrary(lib);
     if (!valid_wg_key(kp.public_key) || !valid_wg_key(kp.private_key)) throw std::runtime_error("tunnel.dll produced an invalid keypair");
     return kp;
 }
@@ -424,35 +429,77 @@ void delete_service() {
 }
 
 bool query_status(TunnelStatus& out, std::string& error) {
-    HANDLE pipe = INVALID_HANDLE_VALUE;
-    for (int attempt = 0; attempt < 2; ++attempt) {
-        pipe = CreateFileW(kUapiPipe, GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
-        if (pipe != INVALID_HANDLE_VALUE) break;
-        if (GetLastError() != ERROR_PIPE_BUSY) break;
-        WaitNamedPipeW(kUapiPipe, 2000);
-    }
-    if (pipe == INVALID_HANDLE_VALUE) {
+    // WireGuardNT has no userspace-API pipe: tunnel.dll drives the kernel driver directly, so peer
+    // and handshake state is read from wireguard.dll's adapter API. The DLL stays loaded for the
+    // process lifetime (same reason as tunnel.dll).
+    static HMODULE lib = LoadLibraryW((exe_dir() + L"\\wireguard.dll").c_str());
+    if (!lib) { error = "wireguard.dll could not be loaded"; return false; }
+    using OpenFn = WIREGUARD_ADAPTER_HANDLE(WINAPI*)(LPCWSTR);
+    using CloseFn = VOID(WINAPI*)(WIREGUARD_ADAPTER_HANDLE);
+    using GetFn = BOOL(WINAPI*)(WIREGUARD_ADAPTER_HANDLE, WIREGUARD_INTERFACE*, DWORD*);
+    static auto open_adapter = reinterpret_cast<OpenFn>(reinterpret_cast<void*>(GetProcAddress(lib, "WireGuardOpenAdapter")));
+    static auto close_adapter = reinterpret_cast<CloseFn>(reinterpret_cast<void*>(GetProcAddress(lib, "WireGuardCloseAdapter")));
+    static auto get_config = reinterpret_cast<GetFn>(reinterpret_cast<void*>(GetProcAddress(lib, "WireGuardGetConfiguration")));
+    if (!open_adapter || !close_adapter || !get_config) { error = "wireguard.dll is missing the adapter API"; return false; }
+
+    WIREGUARD_ADAPTER_HANDLE adapter = open_adapter(widen(kTunnelName).c_str());
+    if (!adapter) {
         const DWORD err = GetLastError();
         error = err == ERROR_FILE_NOT_FOUND ? "tunnel is not running" :
                 err == ERROR_ACCESS_DENIED  ? "tunnel status needs Administrator" : "cannot reach the tunnel";
         return false;
     }
-    static const char kGet[] = "get=1\n\n";
-    DWORD written = 0;
-    if (!WriteFile(pipe, kGet, DWORD(sizeof kGet - 1), &written, nullptr)) {
-        CloseHandle(pipe);
-        error = "writing to the WireGuard API pipe failed";
-        return false;
+    // DWORD64 elements keep the buffer 8-aligned, which the WIREGUARD_* structs require.
+    std::vector<DWORD64> mem(512);
+    DWORD bytes = DWORD(mem.size() * sizeof(DWORD64));
+    while (!get_config(adapter, reinterpret_cast<WIREGUARD_INTERFACE*>(mem.data()), &bytes)) {
+        if (GetLastError() != ERROR_MORE_DATA) {
+            close_adapter(adapter);
+            error = "reading the tunnel configuration failed";
+            return false;
+        }
+        mem.resize((bytes + sizeof(DWORD64) - 1) / sizeof(DWORD64));
+        bytes = DWORD(mem.size() * sizeof(DWORD64));
     }
-    std::string resp;
-    char buf[4096];
-    DWORD n = 0;
-    while (ReadFile(pipe, buf, sizeof buf, &n, nullptr) && n) {
-        resp.append(buf, n);
-        if (resp.find("\nerrno=") != std::string::npos && resp.size() >= 2 && resp.compare(resp.size() - 2, 2, "\n\n") == 0) break;
+    close_adapter(adapter);
+
+    const auto* iface = reinterpret_cast<const WIREGUARD_INTERFACE*>(mem.data());
+    TunnelStatus st;
+    if (iface->Flags & WIREGUARD_INTERFACE_HAS_PUBLIC_KEY)
+        st.interface_public_key = base64_std_encode(std::string(reinterpret_cast<const char*>(iface->PublicKey), WIREGUARD_KEY_LENGTH));
+    st.listen_port = iface->ListenPort;
+
+    // Exactly one peer is expected; anything beyond the first is ignored on purpose, and a
+    // configuration with none leaves the peer fields empty so the caller refuses the session.
+    if (iface->PeersCount > 0) {
+        const auto* peer = reinterpret_cast<const WIREGUARD_PEER*>(reinterpret_cast<const char*>(iface) + sizeof(WIREGUARD_INTERFACE));
+        if (peer->Flags & WIREGUARD_PEER_HAS_PUBLIC_KEY)
+            st.peer_public_key = base64_std_encode(std::string(reinterpret_cast<const char*>(peer->PublicKey), WIREGUARD_KEY_LENGTH));
+        st.persistent_keepalive = peer->PersistentKeepalive;
+        st.rx_bytes = peer->RxBytes;
+        st.tx_bytes = peer->TxBytes;
+        // 100 ns intervals since 1601-01-01 UTC → Unix seconds; 0 means "never handshaked".
+        st.last_handshake_unix = peer->LastHandshake ? int64_t((peer->LastHandshake - 116444736000000000ULL) / 10000000ULL) : 0;
+        char text[INET6_ADDRSTRLEN] = {};
+        if (peer->Endpoint.si_family == AF_INET &&
+            InetNtopA(AF_INET, &peer->Endpoint.Ipv4.sin_addr, text, sizeof text))
+            st.endpoint = std::string(text) + ":" + std::to_string(ntohs(peer->Endpoint.Ipv4.sin_port));
+        else if (peer->Endpoint.si_family == AF_INET6 &&
+                 InetNtopA(AF_INET6, &peer->Endpoint.Ipv6.sin6_addr, text, sizeof text))
+            st.endpoint = "[" + std::string(text) + "]:" + std::to_string(ntohs(peer->Endpoint.Ipv6.sin6_port));
+        if (peer->AllowedIPsCount > 0) {
+            const auto* aip = reinterpret_cast<const WIREGUARD_ALLOWED_IP*>(reinterpret_cast<const char*>(peer) + sizeof(WIREGUARD_PEER));
+            char ip[INET6_ADDRSTRLEN] = {};
+            if (aip->AddressFamily == AF_INET && InetNtopA(AF_INET, &aip->Address.V4, ip, sizeof ip))
+                st.allowed_ip = std::string(ip) + "/" + std::to_string(aip->Cidr);
+            else if (aip->AddressFamily == AF_INET6 && InetNtopA(AF_INET6, &aip->Address.V6, ip, sizeof ip))
+                st.allowed_ip = std::string(ip) + "/" + std::to_string(aip->Cidr);
+        }
     }
-    CloseHandle(pipe);
-    return parse_uapi_status(resp, out, error);
+    st.valid = !st.interface_public_key.empty();
+    if (!st.valid) { error = "the tunnel reported no interface key"; return false; }
+    out = st;
+    return true;
 }
 
 RouteAudit audit_routes(const std::string& peer_ip) {
@@ -505,13 +552,33 @@ RouteAudit audit_routes(const std::string& peer_ip) {
     }
     if (rc == NO_ERROR) {
         bool found = false;
+        std::string published;
         for (auto* p = reinterpret_cast<PIP_ADAPTER_ADDRESSES>(mem.data()); p; p = p->Next) {
             if (p->Luid.Value != tun.Value) continue;
             found = true;
-            a.no_dns_on_tunnel = p->FirstDnsServerAddress == nullptr;
+            for (auto* d = p->FirstDnsServerAddress; d; d = d->Next) {
+                char text[INET6_ADDRSTRLEN] = {};
+                const auto* sa = d->Address.lpSockaddr;
+                if (!sa) continue;
+                if (sa->sa_family == AF_INET)
+                    InetNtopA(AF_INET, &reinterpret_cast<const sockaddr_in*>(sa)->sin_addr, text, sizeof text);
+                else if (sa->sa_family == AF_INET6)
+                    InetNtopA(AF_INET6, &reinterpret_cast<const sockaddr_in6*>(sa)->sin6_addr, text, sizeof text);
+                else
+                    continue;
+                // Windows reports fec0:0:0:ffff::1-3 on every adapter whose IPv6 DNS is unset;
+                // they are its built-in placeholder list, not servers this adapter publishes.
+                if (std::strcmp(text, "fec0:0:0:ffff::1") == 0 || std::strcmp(text, "fec0:0:0:ffff::2") == 0 ||
+                    std::strcmp(text, "fec0:0:0:ffff::3") == 0)
+                    continue;
+                if (!published.empty()) published += ", ";
+                published += text;
+            }
             break;
         }
-        if (!found || !a.no_dns_on_tunnel) a.problems.push_back("the scshr tunnel adapter publishes DNS servers");
+        a.no_dns_on_tunnel = found && published.empty();
+        if (!found) a.problems.push_back("the scshr tunnel adapter was not found while checking DNS");
+        else if (!published.empty()) a.problems.push_back("the scshr tunnel adapter publishes DNS servers: " + published);
     } else {
         a.problems.push_back("could not enumerate network adapters");
     }

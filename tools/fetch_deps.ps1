@@ -32,7 +32,7 @@ $wgWinRepo = "https://git.zx2c4.com/wireguard-windows"
 $wgWinCommit = "f8256e035eb65460ac4eba93d7487163353e0326"   # tag v0.6.1
 New-Item -ItemType Directory -Force $wgDir | Out-Null
 
-if (-not (Test-Path (Join-Path $wgDir "wireguard.dll"))) {
+if (-not ((Test-Path (Join-Path $wgDir "wireguard.dll")) -and (Test-Path (Join-Path $wgDir "wireguard.h")))) {
   $ntZip = Join-Path $tp "wireguard-nt-1.1.zip"
   if (-not (Test-Path $ntZip)) { Invoke-WebRequest -Uri $wgNtUrl -OutFile $ntZip }
   $h = (Get-FileHash $ntZip -Algorithm SHA256).Hash.ToLower()
@@ -41,9 +41,12 @@ if (-not (Test-Path (Join-Path $wgDir "wireguard.dll"))) {
   if (Test-Path $ntTmp) { Remove-Item -Recurse -Force $ntTmp }
   Expand-Archive -Path $ntZip -DestinationPath $ntTmp -Force
   Copy-Item (Join-Path $ntTmp "wireguard-nt\bin\amd64\wireguard.dll") $wgDir -Force
+  # The adapter API header: scshr reads peer/handshake state straight from the driver, because
+  # tunnel.dll drives WireGuardNT and exposes no userspace-API pipe.
+  Copy-Item (Join-Path $ntTmp "wireguard-nt\include\wireguard.h") $wgDir -Force
   Copy-Item (Join-Path $ntTmp "wireguard-nt\LICENSE.txt") (Join-Path $wgDir "LICENSE.wireguard-nt.txt") -Force
   Remove-Item -Recurse -Force $ntTmp
-  Write-Host "wireguard.dll (WireGuardNT 1.1) ready"
+  Write-Host "wireguard.dll + wireguard.h (WireGuardNT 1.1) ready"
 }
 
 if (-not (Test-Path (Join-Path $wgDir "tunnel.dll"))) {

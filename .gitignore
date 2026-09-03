@@ -10,3 +10,6 @@ testdata/*
 # fetched by tools/fetch_deps.ps1
 third_party/ffmpeg/
 third_party/ffmpeg-*.zip
+third_party/wireguard/
+third_party/wireguard-nt-*.zip
+third_party/wireguard-windows/
