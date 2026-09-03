@@ -141,9 +141,20 @@ set(MAC_HELPER_FILES
   "${MAC_HELPER_DIR}/scshr-tunnel-darwin-arm64"
   "${MAC_HELPER_DIR}/scshr-tunnel-darwin-amd64")
 if(EXISTS "${MAC_HELPER_DIR}/scshr-tunnel-darwin-arm64" AND EXISTS "${MAC_HELPER_DIR}/scshr-tunnel-darwin-amd64")
-  add_custom_command(TARGET scshr POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:scshr>/mac"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${MAC_HELPER_FILES} "$<TARGET_FILE_DIR:scshr>/mac")
+  # A real dependency (not POST_BUILD): an edited script or a rebuilt helper must be restaged even
+  # when scshr.exe itself does not relink.
+  set(MAC_STAGE_DIR "${CMAKE_BINARY_DIR}/mac")
+  set(MAC_STAGED_FILES)
+  foreach(f ${MAC_HELPER_FILES})
+    get_filename_component(name "${f}" NAME)
+    add_custom_command(OUTPUT "${MAC_STAGE_DIR}/${name}"
+      COMMAND ${CMAKE_COMMAND} -E make_directory "${MAC_STAGE_DIR}"
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different "${f}" "${MAC_STAGE_DIR}/${name}"
+      DEPENDS "${f}" COMMENT "staging mac/${name}")
+    list(APPEND MAC_STAGED_FILES "${MAC_STAGE_DIR}/${name}")
+  endforeach()
+  add_custom_target(scshr_mac_bundle ALL DEPENDS ${MAC_STAGED_FILES})
+  add_dependencies(scshr scshr_mac_bundle)
 else()
   message(WARNING "macOS tunnel helper missing under ${MAC_HELPER_DIR}: run tools/fetch_deps.ps1 (cross-compiles tools/mac-tunnel with Go); the mac/ bundle will not be staged")
 endif()
@@ -172,6 +183,9 @@ add_executable(scshr_synth tools/synth.cpp)
 target_link_libraries(scshr_synth PRIVATE scshr_core)
 add_executable(scshr_sender tools/sender.cpp)
 target_link_libraries(scshr_sender PRIVATE scshr_core winmm)
+add_executable(scshr_inputprobe tools/inputprobe.cpp)
+target_link_libraries(scshr_inputprobe PRIVATE scshr_media)
+target_link_options(scshr_inputprobe PRIVATE /DEBUG:NONE)   # diagnostic tool; LTCG PDB limit (LNK1140)
 add_executable(scshr_bench tools/bench.cpp)
 target_link_libraries(scshr_bench PRIVATE scshr_core)
 add_executable(scshr_vectors tools/vectors.cpp)
