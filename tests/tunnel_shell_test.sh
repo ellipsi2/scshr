@@ -53,6 +53,36 @@ case "$conf" in
     *) ok "macos_conf_route_policy" ;;
 esac
 
+# ── launchd + preflight contract ──────────────────────────────────────────────────────────────
+expect_file "launchd_plist_generation" "${gold}/net.scshr.tunnel.plist" \
+    "$("$sh" render-plist /usr/local/libexec/scshr-macos-tunnel.sh)"
+
+# The daemon must supervise the tunnel itself: a crashed helper has to be restarted, not left down
+# while the machine believes the tunnel is running.
+plist="$("$sh" render-plist /usr/local/libexec/scshr-macos-tunnel.sh)"
+case "$plist" in
+    *"<key>KeepAlive</key><true/>"*) ok "launchd_plist_keepalive" ;;
+    *) bad "launchd_plist_keepalive" "the LaunchDaemon does not set KeepAlive" ;;
+esac
+
+# The Windows wizard parses exactly these keys out of `preflight`.
+expect_eq "preflight_keys" "macos_version
+arch
+helper
+pf_conf
+screen_sharing
+sudo
+firewall" "$("$sh" render-preflight-keys)"
+
+# The Mac side must be self-contained: stock macOS plus the uploaded files, so nothing may depend
+# on Homebrew wireguard-tools or on a bash newer than the 3.2 macOS ships.
+script_text="$(cat "$sh")"
+case "$script_text" in
+    *wg-quick*|*"brew install"*|*BASH_VERSINFO*)
+        bad "no_wireguard_tools_dependency" "the script still needs wireguard-tools or bash 4+" ;;
+    *) ok "no_wireguard_tools_dependency" ;;
+esac
+
 # ── descriptor encoding cross-check against the C++ encoder ───────────────────────────────────
 expect_eq "server_code_matches_cxx_golden" "$SERVER_CODE" \
     "$("$sh" render-server-code "$MAC_PUB" my-mac.example.net 51820 10.77.77.1 10.77.77.2)"

@@ -1,6 +1,7 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # scshr macOS tunnel + Screen Sharing isolation.
 #
+#   sudo ./tools/scshr-macos-tunnel.sh preflight
 #   sudo ./tools/scshr-macos-tunnel.sh init --endpoint my-mac.example.net [--listen-port 51820]
 #   sudo ./tools/scshr-macos-tunnel.sh pair 'SCCL1:<windows-code>'
 #   sudo ./tools/scshr-macos-tunnel.sh up | down | status
@@ -9,6 +10,10 @@
 # This is NOT a VPN. It creates one WireGuard peering between this Mac (10.77.77.1) and one paired
 # Windows machine (10.77.77.2) and then restricts Screen Sharing so it is reachable only across
 # that peering. Nothing here enables forwarding, NAT or routing: the Mac is never an exit node.
+#
+# Nothing needs to be installed on this Mac. The WireGuard implementation is the single static
+# helper binary shipped next to this script (scshr-tunnel-darwin-arm64 / -amd64); there is no
+# dependency on Homebrew, wireguard-tools or bash 4 — stock /bin/bash 3.2 runs this.
 #
 # Everything is idempotent; nothing persistent is mutated before every prerequisite and every
 # generated file has been validated, and a failed firewall activation is rolled back.
@@ -31,8 +36,18 @@ PF_ANCHOR="/etc/pf.anchors/${TUNNEL_NAME}"
 PF_CONF="/etc/pf.conf"
 PF_ANCHOR_LINE="anchor \"${TUNNEL_NAME}\""
 PF_LOAD_LINE="load anchor \"${TUNNEL_NAME}\" from \"${PF_ANCHOR}\""
-LAUNCHD_PLIST="/Library/LaunchDaemons/net.scshr.tunnel.plist"
+LAUNCHD_LABEL="net.scshr.tunnel"
+LAUNCHD_PLIST="/Library/LaunchDaemons/${LAUNCHD_LABEL}.plist"
 INSTALLED_SCRIPT="/usr/local/libexec/scshr-macos-tunnel.sh"
+INSTALLED_HELPER="/usr/local/libexec/scshr-tunnel"
+TUNNEL_LOG="/var/log/scshr-tunnel.log"
+SCREEN_SHARING_PLIST="/System/Library/LaunchDaemons/com.apple.screensharing.plist"
+UAPI_SOCKET="/var/run/wireguard/${TUNNEL_NAME}.sock"
+UTUN_NAME_FILE="/var/run/scshr-tunnel.utun"
+ALF="/usr/libexec/ApplicationFirewall/socketfilterfw"
+HELPER=""    # set by find_helper
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # Mac-side ports scshr actually uses (src/session/session.h): TCP 5900 control/RFB record layer,
 # UDP 5900 audio + RTCP, UDP 5901 video. Screen Sharing itself listens on TCP 5900.
@@ -54,31 +69,57 @@ b64url_decode() {
 
 need_root() { [ "$(id -u)" = "0" ] || die "this command must run as root (use sudo)"; }
 
-# Locates a supported WireGuard implementation. Homebrew installs under /usr/local or /opt/homebrew.
-# Upstream wg-quick requires bash 4+, which macOS does not ship (stock /bin/bash is 3.2), and its
-# `#!/usr/bin/env bash` picks up whatever bash comes first on PATH — so resolve a bash 4+ here and
-# invoke wg-quick through it explicitly instead of depending on PATH ordering.
-find_wireguard() {
-    local extra="/opt/homebrew/bin:/usr/local/bin:/usr/local/sbin:/opt/homebrew/sbin"
-    PATH="${extra}:${PATH}"
-    export PATH
-    command -v wg >/dev/null 2>&1 || die "wg not found — install WireGuard tools (brew install wireguard-tools)"
-    WG_QUICK_PATH="$(command -v wg-quick 2>/dev/null || true)"
-    [ -n "$WG_QUICK_PATH" ] || die "wg-quick not found — install WireGuard tools (brew install wireguard-tools)"
-    local candidate
-    BASH4=""
-    for candidate in "$(command -v bash)" /opt/homebrew/bin/bash /usr/local/bin/bash; do
-        [ -n "$candidate" ] && [ -x "$candidate" ] || continue
-        case "$("$candidate" -c 'printf %s "${BASH_VERSINFO[0]}"' 2>/dev/null)" in
-            ''|[0-3]) ;;
-            *) BASH4="$candidate"; break ;;
-        esac
-    done
-    [ -n "$BASH4" ] || die "wg-quick requires bash 4+ but only bash ${BASH_VERSINFO[0]} was found — brew install bash"
+# Maps uname -m onto the helper binary suffix used in the uploaded bundle.
+helper_arch() {
+    case "$(uname -m)" in
+        arm64) printf 'arm64' ;;
+        x86_64) printf 'amd64' ;;
+        *) return 1 ;;
+    esac
 }
 
-# Every wg-quick invocation goes through the resolved bash 4+; find_wireguard runs first.
-wgq() { "$BASH4" "$WG_QUICK_PATH" "$@"; }
+# Locates the WireGuard helper: the uploaded bundle copy first, then the installed one.
+# Sets HELPER. There is deliberately no fallback to Homebrew wireguard-tools: a stock Mac has none.
+find_helper() {
+    local arch bundled
+    HELPER=""
+    if arch="$(helper_arch)"; then
+        bundled="${SCRIPT_DIR}/scshr-tunnel-darwin-${arch}"
+        if [ -x "$bundled" ]; then HELPER="$bundled"; return 0; fi
+    fi
+    if [ -x "$INSTALLED_HELPER" ]; then HELPER="$INSTALLED_HELPER"; return 0; fi
+    return 1
+}
+
+require_helper() {
+    find_helper || die "the scshr tunnel helper for this Mac ($(uname -m)) was not found next to this script or at ${INSTALLED_HELPER}"
+}
+
+# ── application firewall ──────────────────────────────────────────────────────────────────────
+# The daemon is unsigned, so with the Application Firewall on it is prompted for — and nobody can
+# answer a prompt for a LaunchDaemon, which silently drops inbound WireGuard handshakes. Adding the
+# helper to the ALF allow list up front is the only way a headless install can work. A Mac with the
+# ALF off has no list to add to, and every call there is a harmless no-op.
+alf_state() {
+    if [ ! -x "$ALF" ]; then printf 'unknown'; return; fi
+    case "$("$ALF" --getglobalstate 2>/dev/null)" in
+        *enabled*) printf 'on' ;;
+        *disabled*) printf 'off' ;;
+        *) printf 'unknown' ;;
+    esac
+}
+
+alf_allow_helper() {
+    [ -x "$ALF" ] || return 0
+    "$ALF" --add "$INSTALLED_HELPER" >/dev/null 2>&1 || true
+    "$ALF" --unblockapp "$INSTALLED_HELPER" >/dev/null 2>&1 || true
+    info "application firewall: ${INSTALLED_HELPER} allowed to accept incoming connections"
+}
+
+alf_remove_helper() {
+    [ -x "$ALF" ] || return 0
+    "$ALF" --remove "$INSTALLED_HELPER" >/dev/null 2>&1 || true
+}
 
 is_wg_key() { printf '%s' "$1" | grep -Eq '^[A-Za-z0-9+/]{42}[A-Za-z0-9+/=]=$'; }
 
@@ -137,6 +178,32 @@ render_pf() {   # <mac-ip> <win-ip> <listen-port>
     printf 'pass in quick proto udp from %s to %s port { %s } keep state\n' "$win" "$mac" "$SCSHR_UDP_PORTS"
     printf 'block drop in quick proto tcp from any to any port { %s }\n' "$SCSHR_TCP_PORTS"
     printf 'block drop in quick proto udp from any to any port { %s }\n' "$SCSHR_UDP_PORTS"
+}
+
+# The daemon runs `<script> run`, which activates PF and then execs the helper. KeepAlive restarts
+# it if the helper ever exits, so a crashed tunnel never leaves Screen Sharing unprotected.
+render_plist() {   # <installed-script>
+    printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>'
+    printf '%s\n' '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">'
+    printf '%s\n' '<plist version="1.0">'
+    printf '%s\n' '<dict>'
+    printf '    <key>Label</key><string>%s</string>\n' "$LAUNCHD_LABEL"
+    printf '%s\n' '    <key>ProgramArguments</key>'
+    printf '%s\n' '    <array>'
+    printf '        <string>%s</string>\n' "$1"
+    printf '%s\n' '        <string>run</string>'
+    printf '%s\n' '    </array>'
+    printf '%s\n' '    <key>RunAtLoad</key><true/>'
+    printf '%s\n' '    <key>KeepAlive</key><true/>'
+    printf '    <key>StandardOutPath</key><string>%s</string>\n' "$TUNNEL_LOG"
+    printf '    <key>StandardErrorPath</key><string>%s</string>\n' "$TUNNEL_LOG"
+    printf '%s\n' '</dict>'
+    printf '%s\n' '</plist>'
+}
+
+# The exact key set `preflight` prints, in order. The Windows wizard parses these.
+render_preflight_keys() {
+    printf '%s\n' macos_version arch helper pf_conf screen_sharing sudo firewall
 }
 
 render_server_code() {   # <public-key> <endpoint> <listen-port> <mac-ip> <win-ip>
@@ -217,10 +284,10 @@ ensure_identity() {
         return
     fi
     [ ! -e "$PRIV_KEY" ] && [ ! -e "$PUB_KEY" ] || die "identity is half-written — run 'uninstall --reset-identity' first"
-    wg genkey >"${PRIV_KEY}.tmp"
+    "$HELPER" genkey >"${PRIV_KEY}.tmp"
     chmod 600 "${PRIV_KEY}.tmp"
     mv -f "${PRIV_KEY}.tmp" "$PRIV_KEY"
-    wg pubkey <"$PRIV_KEY" >"$PUB_KEY"
+    "$HELPER" pubkey <"$PRIV_KEY" >"$PUB_KEY"
     chmod 644 "$PUB_KEY"
     chown root:wheel "$PRIV_KEY" "$PUB_KEY"
     info "identity: new keypair generated (private key never leaves this Mac)"
@@ -231,8 +298,6 @@ write_conf() {   # rewrites $CONF from the stored identity + settings; only when
     local peer_pub peer_ip staged_dir staged
     peer_pub="$(setting peer_public_key)"
     peer_ip="$(setting win_ip "$DEFAULT_WIN_IP")"
-    # wg-quick insists the file it parses is named "<interface>.conf", so stage under that exact
-    # name inside a private temporary directory rather than at a bare mktemp path.
     staged_dir="$(mktemp -d)"
     staged="${staged_dir}/${TUNNEL_NAME}.conf"
     if [ -n "$peer_pub" ]; then
@@ -241,11 +306,12 @@ write_conf() {   # rewrites $CONF from the stored identity + settings; only when
         render_conf "$(cat "$PRIV_KEY")" "$(setting mac_ip "$DEFAULT_MAC_IP")" "$(setting listen_port "$DEFAULT_LISTEN_PORT")" >"$staged"
     fi
     chmod 600 "$staged"
-    # Validate before anything persistent changes: wg parses the [Interface]/[Peer] stanzas itself.
+    # Validate before anything persistent changes: the helper parses the stanzas itself and fails
+    # closed on anything that would widen the tunnel.
     local verdict
-    if ! verdict="$(wgq strip "$staged" 2>&1 >/dev/null)"; then
+    if ! verdict="$("$HELPER" check "$staged" 2>&1 >/dev/null)"; then
         rm -rf "$staged_dir"
-        die "generated WireGuard configuration failed validation: ${verdict:-no output from wg-quick}"
+        die "generated WireGuard configuration failed validation: ${verdict:-no output from the helper}"
     fi
     if [ -f "$CONF" ] && cmp -s "$staged" "$CONF"; then
         rm -rf "$staged_dir"
@@ -266,21 +332,31 @@ install_pf() {
 
     anchor_tmp="$(mktemp)"
     render_pf "$mac" "$win" "$port" >"$anchor_tmp"
+    pfctl -n -f "$anchor_tmp" >/dev/null 2>&1 || die "generated PF anchor failed syntax validation — no firewall change was made"
     mkdir -p /etc/pf.anchors
-    install -m 644 -o root -g wheel "$anchor_tmp" "$PF_ANCHOR"
+    if ! cmp -s "$anchor_tmp" "$PF_ANCHOR"; then
+        install -m 644 -o root -g wheel "$anchor_tmp" "$PF_ANCHOR"
+    fi
     rm -f "$anchor_tmp"
-    pfctl -n -f "$PF_ANCHOR" >/dev/null 2>&1 || die "generated PF anchor failed syntax validation — no firewall change was made"
+
+    # `pair` re-runs this after `init`. When /etc/pf.conf already loads our anchor there is nothing
+    # to edit, so skip the backup and rewrite entirely and just reload — otherwise every pairing
+    # leaves another identical copy in the backup directory.
+    if grep -Fq "$PF_LOAD_LINE" "$PF_CONF"; then
+        pfctl -E -f "$PF_CONF" >/dev/null 2>&1 ||
+            die "activating PF failed — ${PF_CONF} was not modified; Screen Sharing isolation is NOT active"
+        info "firewall: Screen Sharing (tcp ${SCSHR_TCP_PORTS}, udp ${SCSHR_UDP_PORTS}) reachable only from ${win}; udp/${port} open for WireGuard"
+        return 0
+    fi
 
     staged="$(mktemp)"
     cp "$PF_CONF" "$staged"
-    if ! grep -Fq "$PF_LOAD_LINE" "$staged"; then
-        # Smallest possible edit: two lines appended to the filter section.
-        {
-            printf '\n# scshr application tunnel isolation (added by scshr-macos-tunnel.sh)\n'
-            printf '%s\n' "$PF_ANCHOR_LINE"
-            printf '%s\n' "$PF_LOAD_LINE"
-        } >>"$staged"
-    fi
+    # Smallest possible edit: two lines appended to the filter section.
+    {
+        printf '\n# scshr application tunnel isolation (added by scshr-macos-tunnel.sh)\n'
+        printf '%s\n' "$PF_ANCHOR_LINE"
+        printf '%s\n' "$PF_LOAD_LINE"
+    } >>"$staged"
     if ! pfctl -n -f "$staged" >/dev/null 2>&1; then
         rm -f "$staged"
         die "PF configuration failed syntax validation — /etc/pf.conf was left untouched"
@@ -321,50 +397,126 @@ remove_pf() {
 }
 
 # ── persistence ───────────────────────────────────────────────────────────────────────────────
+install_helper() {
+    local arch bundled
+    arch="$(helper_arch)" || die "unsupported CPU architecture: $(uname -m)"
+    bundled="${SCRIPT_DIR}/scshr-tunnel-darwin-${arch}"
+    mkdir -p "$(dirname "$INSTALLED_HELPER")"
+    if [ -x "$bundled" ]; then
+        install -m 755 -o root -g wheel "$bundled" "$INSTALLED_HELPER"
+    elif [ ! -x "$INSTALLED_HELPER" ]; then
+        die "no scshr tunnel helper for ${arch} next to this script and none installed at ${INSTALLED_HELPER}"
+    fi
+    alf_allow_helper
+}
+
 install_launchd() {
     mkdir -p "$(dirname "$INSTALLED_SCRIPT")"
     install -m 755 -o root -g wheel "$0" "$INSTALLED_SCRIPT"
-    cat >"${LAUNCHD_PLIST}.tmp" <<PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key><string>net.scshr.tunnel</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>${INSTALLED_SCRIPT}</string>
-        <string>up</string>
-    </array>
-    <key>RunAtLoad</key><true/>
-    <key>KeepAlive</key><false/>
-    <key>StandardErrorPath</key><string>/var/log/scshr-tunnel.log</string>
-</dict>
-</plist>
-PLIST
+    render_plist "$INSTALLED_SCRIPT" >"${LAUNCHD_PLIST}.tmp"
     install -m 644 -o root -g wheel "${LAUNCHD_PLIST}.tmp" "$LAUNCHD_PLIST"
     rm -f "${LAUNCHD_PLIST}.tmp"
+}
+
+# Unloading returns as soon as launchd has signalled the job, but the old helper still holds the
+# UAPI socket and udp/<listen-port> for a moment. Starting the replacement before it is gone makes
+# the new process exit with "unix socket in use" or EADDRINUSE, and KeepAlive then sits out its
+# 10 s throttle — so wait until nothing answers on the socket before loading again.
+daemon_unload() {
     launchctl unload "$LAUNCHD_PLIST" >/dev/null 2>&1 || true
-    launchctl load -w "$LAUNCHD_PLIST" >/dev/null 2>&1 || info "WARNING: launchctl load failed; the tunnel will not come back automatically after a reboot"
+    local i=0
+    while [ "$i" -lt 15 ]; do
+        tunnel_is_up || break
+        sleep 1
+        i=$((i+1))
+    done
+    # A helper killed outright leaves both behind; the socket is unlinked on the next open, but a
+    # stale interface name would make `status` report an interface that no longer exists.
+    if ! tunnel_is_up; then rm -f "$UAPI_SOCKET" "$UTUN_NAME_FILE"; fi
+}
+daemon_load() {
+    [ -f "$LAUNCHD_PLIST" ] || die "the scshr LaunchDaemon is not installed — run 'init' first"
+    # Already-loaded is not an error: launchctl load is how this stays idempotent.
+    launchctl load -w "$LAUNCHD_PLIST" >/dev/null 2>&1 || true
 }
 
 # ── lifecycle ─────────────────────────────────────────────────────────────────────────────────
-tunnel_is_up() { wg show "$TUNNEL_NAME" >/dev/null 2>&1; }
+tunnel_is_up() { [ -n "$HELPER" ] && "$HELPER" status >/dev/null 2>&1; }
+
+# 30s, not 10: a helper that lost a race with its predecessor is restarted by KeepAlive only after
+# launchd's 10 s throttle, and that retry must still be inside the window.
+wait_up() {
+    local i=0
+    while [ "$i" -lt 30 ]; do
+        if tunnel_is_up; then return 0; fi
+        sleep 1
+        i=$((i+1))
+    done
+    tunnel_is_up
+}
+
+# Executed by launchd. PF first and fail closed: if isolation cannot be activated the tunnel must
+# not start, and KeepAlive will retry rather than leave Screen Sharing exposed.
+cmd_run() {
+    need_root
+    require_helper
+    [ -f "$CONF" ] || die "not initialised — run 'init' first"
+    pfctl -E -f "$PF_CONF" >/dev/null 2>&1 ||
+        die "could not activate PF — refusing to start the tunnel with Screen Sharing exposed"
+    exec "$HELPER" run "$CONF"
+}
 
 cmd_up() {
     need_root
-    find_wireguard
+    require_helper
     [ -f "$CONF" ] || die "not initialised — run 'init' first"
-    pfctl -E -f "$PF_CONF" >/dev/null 2>&1 || die "could not activate PF — refusing to start the tunnel with Screen Sharing exposed"
-    tunnel_is_up || wgq up "$CONF"
+    daemon_load
+    wait_up || die "the tunnel did not come up within 30s — see ${TUNNEL_LOG}"
     info "tunnel up: $(setting mac_ip "$DEFAULT_MAC_IP")/32 listening on udp/$(setting listen_port "$DEFAULT_LISTEN_PORT")"
 }
 
 cmd_down() {
     need_root
-    find_wireguard
-    if tunnel_is_up; then wgq down "$CONF"; fi
+    find_helper || true
+    daemon_unload
     # PF rules stay in place: taking the tunnel down must not re-expose Screen Sharing.
     info "tunnel down (Screen Sharing isolation remains active)"
+}
+
+# ── environment report (consumed by the Windows wizard) ───────────────────────────────────────
+screen_sharing_state() {
+    if launchctl print "system/com.apple.screensharing" >/dev/null 2>&1; then
+        printf 'enabled'
+    elif [ -f "$SCREEN_SHARING_PLIST" ]; then
+        printf 'disabled'
+    else
+        printf 'unknown'
+    fi
+}
+
+cmd_preflight() {
+    local helper_state="missing"
+    if find_helper; then helper_state="ok"; fi
+    printf 'macos_version=%s\n' "$(sw_vers -productVersion 2>/dev/null || echo unknown)"
+    printf 'arch=%s\n' "$(uname -m)"
+    printf 'helper=%s\n' "$helper_state"
+    printf 'pf_conf=%s\n' "$([ -f "$PF_CONF" ] && echo present || echo missing)"
+    printf 'screen_sharing=%s\n' "$(screen_sharing_state)"
+    # Only reached when sudo already worked, so this is a constant by construction.
+    printf 'sudo=ok\n'
+    printf 'firewall=%s\n' "$(alf_state)"
+    [ "$helper_state" = "ok" ] || die "no scshr tunnel helper for this Mac ($(uname -m)) — upload the matching helper next to this script"
+}
+
+cmd_enable_screen_sharing() {
+    need_root
+    [ -f "$SCREEN_SHARING_PLIST" ] || die "${SCREEN_SHARING_PLIST} not found — this macOS does not ship Screen Sharing where scshr expects it"
+    launchctl load -w "$SCREEN_SHARING_PLIST" >/dev/null 2>&1 || true
+    local state
+    state="$(screen_sharing_state)"
+    printf 'screen_sharing=%s\n' "$state"
+    [ "$state" = "enabled" ] ||
+        die "Screen Sharing is still off — on the Mac, turn on System Settings > General > Sharing > Screen Sharing"
 }
 
 cmd_init() {
@@ -379,7 +531,7 @@ cmd_init() {
         esac
     done
     need_root
-    find_wireguard
+    require_helper
     command -v pfctl >/dev/null 2>&1 || die "pfctl not found — this script requires macOS packet filter"
     [ -f "$PF_CONF" ] || die "${PF_CONF} not found — refusing to create one from scratch"
     [ -n "$endpoint" ] || die "--endpoint is required: the public hostname or IP at which this Mac's WireGuard port is reachable"
@@ -393,28 +545,33 @@ cmd_init() {
     save_settings "$endpoint" "$port" "$mac_ip" "$win_ip" "$(setting peer_public_key)"
     if write_conf; then info "configuration written to ${CONF}"; else info "configuration already current"; fi
     install_pf
+    install_helper
     install_launchd
-    if tunnel_is_up; then wgq down "$CONF" >/dev/null 2>&1 || true; fi
-    wgq up "$CONF"
+    daemon_unload
+    daemon_load
+    wait_up || die "the tunnel did not come up within 30s — see ${TUNNEL_LOG}"
 
     if [ "$(sysctl -n net.inet.ip.forwarding 2>/dev/null || echo 0)" != "0" ]; then
         info "NOTE: IP forwarding is enabled on this Mac by something else — scshr did not enable it and does not need it"
     fi
 
     printf '\n'
-    info "macOS tunnel ready. Give this pairing code to Windows:"
-    printf '\n    %s\n\n' "$(render_server_code "$(cat "$PUB_KEY")" "$endpoint" "$port" "$mac_ip" "$win_ip")"
+    info "macOS tunnel ready."
     printf 'Next:\n'
-    printf '  1. On Windows:  .\\scshr.exe init      (paste the code above)\n'
+    printf '  1. On Windows:  .\\scshr.exe init      (paste the code below)\n'
     printf '  2. Back here :  sudo %s pair '"'"'SCCL1:<code Windows printed>'"'"'\n' "$0"
-    printf '\nIf this Mac is behind NAT, forward udp/%s to it; nothing else needs to be reachable.\n' "$port"
+    # Advice goes to stderr so the pairing code is the last line on stdout: the Windows wizard
+    # extracts the code from stdout and must not have to skip trailing prose.
+    printf 'If this Mac is behind NAT, forward udp/%s to it; nothing else needs to be reachable.\n' "$port" >&2
+    printf 'Pairing code for Windows:\n'
+    render_server_code "$(cat "$PUB_KEY")" "$endpoint" "$port" "$mac_ip" "$win_ip"
 }
 
 cmd_pair() {
     local code="${1:-}"
     [ -n "$code" ] || die "usage: pair 'SCCL1:<windows-code>'"
     need_root
-    find_wireguard
+    require_helper
     [ -s "$PRIV_KEY" ] || die "not initialised — run 'init' first"
     decode_client_code "$code"
     [ "$WIN_IP" = "$(setting win_ip "$DEFAULT_WIN_IP")" ] ||
@@ -422,8 +579,9 @@ cmd_pair() {
     save_settings "$(setting endpoint)" "$(setting listen_port "$DEFAULT_LISTEN_PORT")" \
                   "$(setting mac_ip "$DEFAULT_MAC_IP")" "$WIN_IP" "$WIN_PUB"
     if write_conf; then
-        if tunnel_is_up; then wgq down "$CONF"; fi
-        wgq up "$CONF"
+        daemon_unload
+        daemon_load
+        wait_up || die "the tunnel did not come back up within 30s — see ${TUNNEL_LOG}"
         info "paired with Windows peer $(printf '%s' "$WIN_PUB" | cut -c1-8)… at ${WIN_IP}/32"
     else
         info "already paired with this peer"
@@ -433,7 +591,7 @@ cmd_pair() {
 
 cmd_status() {
     need_root
-    find_wireguard
+    require_helper
     printf 'scshr macOS tunnel\n'
     printf '  configuration   : %s\n' "$([ -f "$CONF" ] && echo present || echo missing)"
     printf '  local address   : %s/32\n' "$(setting mac_ip "$DEFAULT_MAC_IP")"
@@ -441,8 +599,8 @@ cmd_status() {
     printf '  public endpoint : %s:%s\n' "$(setting endpoint '(unset)')" "$(setting listen_port "$DEFAULT_LISTEN_PORT")"
     printf '  public key      : %s\n' "$([ -f "$PUB_KEY" ] && cat "$PUB_KEY" || echo '(none)')"
     if tunnel_is_up; then
-        printf '  state           : up on %s\n' "$(wg show "$TUNNEL_NAME" 2>/dev/null | sed -n '1s/^interface: //p')"
-        wg show "$TUNNEL_NAME" | sed 's/^/    /'
+        printf '  state           : up\n'
+        "$HELPER" status | sed 's/^/    /'
     else
         printf '  state           : down\n'
     fi
@@ -450,6 +608,7 @@ cmd_status() {
     printf '  pf              : %s\n' "$(pfctl -s info 2>/dev/null | sed -n '1s/^Status: //p' || echo unknown)"
     printf '  isolation rules :\n'
     pfctl -a "$TUNNEL_NAME" -s rules 2>/dev/null | sed 's/^/    /' || printf '    (anchor not loaded)\n'
+    printf '  screen sharing  : %s\n' "$(screen_sharing_state)"
     printf '  launchd         : %s\n' "$([ -f "$LAUNCHD_PLIST" ] && echo installed || echo 'not installed')"
     # Private key material is never printed.
 }
@@ -463,14 +622,14 @@ cmd_uninstall() {
         esac
     done
     need_root
-    find_wireguard
-    if tunnel_is_up; then wgq down "$CONF" >/dev/null 2>&1 || true; fi
+    find_helper || true
     if [ -f "$LAUNCHD_PLIST" ]; then
-        launchctl unload "$LAUNCHD_PLIST" >/dev/null 2>&1 || true
+        daemon_unload
         rm -f "$LAUNCHD_PLIST"
         info "removed ${LAUNCHD_PLIST}"
     fi
-    rm -f "$INSTALLED_SCRIPT"
+    alf_remove_helper
+    rm -f "$INSTALLED_SCRIPT" "$INSTALLED_HELPER"
     remove_pf
     rm -f "$CONF" "$SETTINGS"
     if [ "$reset" = "1" ]; then
@@ -487,14 +646,18 @@ usage() {
     cat <<USAGE
 scshr macOS tunnel
 
+  sudo $0 preflight
   sudo $0 init --endpoint HOST [--listen-port ${DEFAULT_LISTEN_PORT}] [--mac-ip ${DEFAULT_MAC_IP}] [--win-ip ${DEFAULT_WIN_IP}]
   sudo $0 pair 'SCCL1:<windows-code>'
-  sudo $0 up | down | status
+  sudo $0 up | down | status | run
+  sudo $0 enable-screen-sharing
   sudo $0 uninstall [--reset-identity]
 
 Test helpers (no root, no side effects):
   $0 render-conf <private-key> <mac-ip> <port> [<peer-public-key> <peer-ip>]
   $0 render-pf <mac-ip> <win-ip> <listen-port>
+  $0 render-plist <installed-script>
+  $0 render-preflight-keys
   $0 render-server-code <public-key> <endpoint> <port> <mac-ip> <win-ip>
   $0 render-client-code <public-key> <win-ip>
   $0 decode-client-code <SCCL1:...>
@@ -502,14 +665,19 @@ USAGE
 }
 
 case "${1:-}" in
+    preflight) shift; cmd_preflight "$@" ;;
     init) shift; cmd_init "$@" ;;
     pair) shift; cmd_pair "$@" ;;
+    run) shift; cmd_run "$@" ;;
     up) shift; cmd_up "$@" ;;
     down) shift; cmd_down "$@" ;;
     status) shift; cmd_status "$@" ;;
+    enable-screen-sharing) shift; cmd_enable_screen_sharing "$@" ;;
     uninstall) shift; cmd_uninstall "$@" ;;
     render-conf) shift; render_conf "$@" ;;
     render-pf) shift; render_pf "$@" ;;
+    render-plist) shift; render_plist "${1:-$INSTALLED_SCRIPT}" ;;
+    render-preflight-keys) shift; render_preflight_keys ;;
     render-server-code) shift; render_server_code "$@" ;;
     render-client-code) shift; render_client_code "$@" ;;
     decode-client-code) shift; decode_client_code "${1:-}"; printf '%s %s\n' "$WIN_PUB" "$WIN_IP" ;;

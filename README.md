@@ -1,5 +1,10 @@
 # scshr — native Windows client for Apple Screen Sharing High Performance mode
 
+**Using it (no technical knowledge needed): read [docs/USER-GUIDE.md](docs/USER-GUIDE.md).** Unzip, double-click
+`scshr.exe`, type the Mac's address and an administrator login, click **Set up**; the wizard reaches the Mac over
+SSH, installs the tunnel on both sides, turns on Screen Sharing and tests the link. Then **Connect** shows the Mac's
+screen with mouse, keyboard, sound and clipboard. The rest of this file is for developers.
+
 Native C++20 port of [iShareScreen](https://github.com/renegadelink/iShareScreen)'s desktop receiver, built
 around a bounded, GPU-resident media path:
 
@@ -21,24 +26,44 @@ then takes the freshest frames, so stale frames are replaced instead of queued.
 ## Build
 
 Requirements: Visual Studio 2022/2026 C++ tools, CMake ≥ 3.25, Ninja, Windows 10/11 SDK, OpenSSL 3.x
-(Shining Light Win64 installer at `C:\Program Files\OpenSSL-Win64`), FFmpeg 9.0.1 shared build (pinned; see
-`third_party/README.md`).
+(Shining Light Win64 installer at `C:\Program Files\OpenSSL-Win64`), git. Everything else is pinned and fetched or
+built from source by `tools/fetch_deps.ps1` (see `third_party/README.md`): FFmpeg 9.0.1 shared, miniz, WireGuardNT +
+the wireguard-windows embeddable tunnel, libssh2 (static, for the pairing wizard), fdk-aac (AAC-ELD audio DLL), and
+the macOS tunnel helper cross-compiled with Go (`tools/mac-tunnel`).
 
 ```powershell
-.\tools\fetch_deps.ps1      # downloads the pinned FFmpeg build + miniz into third_party/
+.\tools\fetch_deps.ps1      # fetch/build every pinned dependency into third_party/
 .\build.ps1                 # Release build into build\Release (Ninja + MSVC)
 .\build\Release\scshr_tests.exe
+bash tests\tunnel_shell_test.sh
+.\tools\package.ps1        # dist\scshr-<version>-win64.zip: the user-distributable folder
 ```
+
+`scshr.exe` is a GUI-subsystem executable with a `requireAdministrator` manifest (the tunnel state and the WireGuard
+driver are Administrators-only). Started without arguments it opens the launcher; with arguments it re-attaches to the
+parent console and behaves as the CLI below. Run the CLI from an **elevated** console: from a non-elevated one every
+call goes through UAC into a new process, redirected stdin/stdout (`--password-stdin`, `> log`) do not follow it, and
+the shell does not wait for it. This applies to `--direct` development sessions and `--list-adapters` too.
 
 ## Run
 
 Sessions run over a dedicated one-Windows-to-one-Mac WireGuard tunnel (see [TUNNEL.md](TUNNEL.md)).
-Set it up once, then the Mac's public address is never needed again:
+Pair once, then the Mac's public address is never needed again. The built-in wizard does both sides over SSH
+(the GUI's **Set up**, or on the command line):
+
+```powershell
+.\build\Release\scshr.exe setup --mac my-mac.example.net --mac-user admin   # prompts for the password
+.\build\Release\scshr.exe check                                             # link status through the tunnel
+.\build\Release\scshr.exe unpair [--mac H --mac-user U] [--reset-identity]  # remove one or both halves
+```
+
+The manual code exchange still works when SSH is unavailable (the helper bundle is the `mac/` folder next to
+`scshr.exe`, copied to the Mac by any means):
 
 ```bash
 # macOS, once
-sudo ./tools/scshr-macos-tunnel.sh init --endpoint my-mac.example.net    # prints SCST1:<code>
-sudo ./tools/scshr-macos-tunnel.sh pair 'SCCL1:<code Windows printed>'
+sudo ./mac/scshr-macos-tunnel.sh init --endpoint my-mac.example.net    # prints SCST1:<code>
+sudo ./mac/scshr-macos-tunnel.sh pair 'SCCL1:<code Windows printed>'
 ```
 
 ```powershell
@@ -58,7 +83,8 @@ Options mirror the Python `iss` CLI: `--advertise WxH[@SCALE]|auto`, `--hidpi au
 `--dynamic/--no-dynamic`, `--codec auto|hevc|avc`, `--decoder auto|sw`, `--curtain/--no-curtain`,
 `--share-console`, `--alt-session`, `--audio/--no-audio`, `--display N|all|combined`, `--record FILE.scshr`,
 `--auto-quit-secs N`, `--stats-interval S`, `-v`, `--log-file PATH`. Added here: `--direct --host H`
-(bypass the tunnel; development only) and the `init` / `status` / `tunnel uninstall` subcommands.
+(bypass the tunnel; development only) and the `setup` / `check` / `unpair` / `init` / `status` / `tunnel uninstall`
+subcommands.
 
 `--codec auto` offers HEVC 4:4:4 only when the GPU + FFmpeg build can hardware-decode it (a real probe decode),
 otherwise H.264 4:2:0 — the same ladder as the reference. On current FFmpeg/D3D11VA there is no HEVC RExt 4:4:4
@@ -71,9 +97,9 @@ percentiles, AU→Present latency, zero-copy/GPU-copy/CPU-upload frame counters,
 
 ## Audio
 
-AAC-ELD-SBR needs `libfdk-aac-2.dll` (MSYS2: `pacman -Sy mingw-w64-x86_64-fdk-aac`); it is loaded at runtime
-from `C:\msys64\mingw64\bin` or the DLL search path. Output goes through WASAPI shared mode with a 40 ms
-jitter target. Without the DLL video runs and audio is skipped.
+AAC-ELD-SBR is decoded with fdk-aac: `fdk-aac.dll`, built from the pinned upstream source by `tools/fetch_deps.ps1`
+and bundled next to `scshr.exe` (an MSYS2 `libfdk-aac-2.dll` is still found as a fallback). Output goes through
+WASAPI shared mode with a 40 ms jitter target. Without the DLL video runs and audio is skipped.
 
 ## Tools
 
@@ -86,8 +112,10 @@ jitter target. Without the DLL video runs and audio is skipped.
 | `scshr --replay-key HEX` | full viewer fed by `scshr_sender` (no TCP handshake) — the end-to-end performance harness |
 | `scshr_bench` | packet-path throughput microbenchmark |
 | `tools/e2e.sh` | one-shot viewer + sender run with summary lines |
-| `tools/scshr-macos-tunnel.sh` | macOS WireGuard identity/pairing/lifecycle + mandatory Screen Sharing PF isolation |
-| `tests/tunnel_shell_test.sh` | static tests for the macOS script (syntax, config/PF goldens, strict descriptor decoding) |
+| `tools/scshr-macos-tunnel.sh` | macOS identity/pairing/lifecycle + mandatory Screen Sharing PF isolation (bash 3.2, no Homebrew) |
+| `tools/mac-tunnel/` | Go: self-contained macOS tunnel daemon (wireguard-go) + keys/status, cross-compiled into `mac/` |
+| `tests/tunnel_shell_test.sh` | static tests for the macOS script (syntax, config/PF/plist goldens, strict descriptor decoding) |
+| `tools/package.ps1` | builds the distributable zip |
 
 Tunnel tests need no macOS host:
 

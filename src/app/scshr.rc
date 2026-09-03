@@ -1,0 +1,115 @@
+// Launcher resources: application icon, manifest (elevation + comctl32 v6 + per-monitor DPI),
+// version stamp and the four launcher dialogs. Dialog text is deliberately plain ASCII; the
+// GUI fills in anything that needs typography at runtime.
+#include <windows.h>
+
+#include "resource.h"
+
+#pragma code_page(65001)
+
+LANGUAGE LANG_ENGLISH, SUBLANG_ENGLISH_US
+
+// RT_MANIFEST (24) id 1: the process manifest.
+1 24 "scshr.manifest"
+
+IDI_APP ICON "scshr.ico"
+
+VS_VERSION_INFO VERSIONINFO
+  FILEVERSION 0,1,0,0
+  PRODUCTVERSION 0,1,0,0
+  FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+  FILEFLAGS 0x0L
+  FILEOS VOS_NT_WINDOWS32
+  FILETYPE VFT_APP
+  FILESUBTYPE VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "FileDescription", "scshr screen sharing client"
+            VALUE "FileVersion",     "0.1.0.0"
+            VALUE "InternalName",    "scshr"
+            VALUE "OriginalFilename","scshr.exe"
+            VALUE "ProductName",     "scshr"
+            VALUE "ProductVersion",  "0.1.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
+
+// ── setup wizard ──────────────────────────────────────────────────────────
+IDD_SETUP DIALOGEX 0, 0, 300, 286
+STYLE DS_SHELLFONT | DS_CENTER | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX
+CAPTION "Set up scshr"
+FONT 9, "MS Shell Dlg", 400, 0, 0x1
+BEGIN
+    LTEXT           "Connect this PC to your Mac. You need the Mac's address and an administrator account on it. Remote Login (SSH) must be turned on on the Mac.",
+                    IDC_SETUP_INTRO, 7, 7, 286, 26
+    LTEXT           "Mac address", IDC_SETUP_HOST_LBL, 7, 40, 286, 8
+    EDITTEXT        IDC_SETUP_HOST, 7, 50, 286, 14, ES_AUTOHSCROLL
+    LTEXT           "Mac user name", IDC_SETUP_USER_LBL, 7, 70, 286, 8
+    EDITTEXT        IDC_SETUP_USER, 7, 80, 286, 14, ES_AUTOHSCROLL
+    LTEXT           "Mac password", IDC_SETUP_PASS_LBL, 7, 100, 286, 8
+    EDITTEXT        IDC_SETUP_PASS, 7, 110, 286, 14, ES_PASSWORD | ES_AUTOHSCROLL
+    AUTOCHECKBOX    "&Advanced", IDC_SETUP_ADVANCED, 7, 131, 120, 10
+    LTEXT           "Tunnel port", IDC_SETUP_PORT_LBL, 7, 148, 45, 8
+    EDITTEXT        IDC_SETUP_PORT, 55, 146, 40, 14, ES_NUMBER | ES_AUTOHSCROLL
+    LTEXT           "Public address (if different)", IDC_SETUP_ENDPOINT_LBL, 105, 148, 90, 8
+    EDITTEXT        IDC_SETUP_ENDPOINT, 198, 146, 95, 14, ES_AUTOHSCROLL
+    // "msctls_progress32" + PBS_SMOOTH (0x01); hidden until setup starts.
+    CONTROL         "", IDC_SETUP_PROGRESS, "msctls_progress32", WS_CHILD | 0x01, 7, 168, 286, 10
+    LTEXT           "", IDC_SETUP_STATUS, 7, 183, 286, 26
+    EDITTEXT        IDC_SETUP_LOG, 7, 212, 286, 52,
+                    ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL | NOT WS_TABSTOP
+    DEFPUSHBUTTON   "&Set up", IDOK, 183, 268, 52, 14
+    PUSHBUTTON      "Cancel", IDCANCEL, 241, 268, 52, 14
+END
+
+// ── connect page ──────────────────────────────────────────────────────────
+IDD_CONNECT DIALOGEX 0, 0, 260, 150
+STYLE DS_SHELLFONT | DS_CENTER | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX
+CAPTION "scshr"
+FONT 9, "MS Shell Dlg", 400, 0, 0x1
+BEGIN
+    LTEXT           "", IDC_CONN_MAC, 7, 7, 246, 10
+    LTEXT           "", IDC_CONN_STATUS, 7, 21, 190, 10
+    PUSHBUTTON      "C&heck", IDC_CONN_CHECK, 203, 18, 50, 14
+    LTEXT           "Mac user name", IDC_CONN_USER_LBL, 7, 40, 246, 8
+    EDITTEXT        IDC_CONN_USER, 7, 50, 246, 14, ES_AUTOHSCROLL
+    LTEXT           "Password", IDC_CONN_PASS_LBL, 7, 70, 246, 8
+    EDITTEXT        IDC_CONN_PASS, 7, 80, 246, 14, ES_PASSWORD | ES_AUTOHSCROLL
+    AUTOCHECKBOX    "&Remember password", IDC_CONN_REMEMBER, 7, 100, 150, 10
+    PUSHBUTTON      "Set up a&gain", IDC_CONN_SETUP_AGAIN, 7, 122, 55, 14
+    PUSHBUTTON      "&Options...", IDC_CONN_OPTIONS, 66, 122, 45, 14
+    PUSHBUTTON      "Re&move", IDC_CONN_REMOVE, 115, 122, 45, 14
+    DEFPUSHBUTTON   "&Connect", IDOK, 195, 122, 58, 14
+END
+
+// ── options ───────────────────────────────────────────────────────────────
+IDD_OPTIONS DIALOGEX 0, 0, 200, 96
+STYLE DS_SHELLFONT | DS_CENTER | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Options"
+FONT 9, "MS Shell Dlg", 400, 0, 0x1
+BEGIN
+    AUTOCHECKBOX    "Play the Mac's sound on this PC", IDC_OPT_AUDIO, 7, 9, 186, 10
+    LTEXT           "Show", IDC_OPT_DISPLAY_LBL, 7, 28, 186, 8
+    COMBOBOX        IDC_OPT_DISPLAY, 7, 39, 186, 120, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    DEFPUSHBUTTON   "OK", IDOK, 85, 75, 50, 14
+    PUSHBUTTON      "Cancel", IDCANCEL, 143, 75, 50, 14
+END
+
+// ── password prompt (used when removing the pairing) ──────────────────────
+IDD_PASSWORD DIALOGEX 0, 0, 240, 82
+STYLE DS_SHELLFONT | DS_CENTER | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Mac password"
+FONT 9, "MS Shell Dlg", 400, 0, 0x1
+BEGIN
+    LTEXT           "", IDC_PWD_TEXT, 7, 7, 226, 26
+    EDITTEXT        IDC_PWD_EDIT, 7, 37, 226, 14, ES_PASSWORD | ES_AUTOHSCROLL
+    DEFPUSHBUTTON   "C&ontinue", IDOK, 118, 60, 55, 14
+    PUSHBUTTON      "S&kip", IDCANCEL, 178, 60, 55, 14
+END

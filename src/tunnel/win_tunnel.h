@@ -61,6 +61,14 @@ KeyPair generate_keypair(const Components& c);
 // Loads the stored identity, creating one on first use. `created` reports which happened.
 KeyPair load_or_create_identity(const Components& c, bool& created);
 
+// ── secure files (SYSTEM + Administrators only; used for state, settings and host-key pins) ─
+void ensure_secure_dir(const std::wstring& dir);
+void write_secure_file(const std::wstring& path, const std::string& data);
+std::optional<std::string> read_file(const std::wstring& path);
+std::string narrow(const std::wstring& w);   // UTF-16 → UTF-8
+std::wstring widen(const std::string& s);    // UTF-8 → UTF-16
+std::wstring exe_dir();
+
 // ── state ─────────────────────────────────────────────────────────────────────────────────
 std::optional<TunnelState> load_state();
 void save_state(const TunnelState& s);

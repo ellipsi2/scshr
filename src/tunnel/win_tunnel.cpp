@@ -42,6 +42,9 @@ constexpr const wchar_t* kServiceDisplay = L"scshr WireGuard Tunnel";
     throw std::runtime_error(what + " (0x" + [&] { char h[16]; snprintf(h, sizeof h, "%08lx", err); return std::string(h); }() + ": " + buf + ")");
 }
 
+}  // namespace
+
+// Exported helpers (also used by app/settings.cpp and app/setup.cpp).
 std::string narrow(const std::wstring& w) {
     if (w.empty()) return {};
     const int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), int(w.size()), nullptr, 0, nullptr, nullptr);
@@ -136,6 +139,8 @@ std::optional<std::string> read_file(const std::wstring& path) {
     CloseHandle(h);
     return out;
 }
+
+namespace {
 
 std::string dpapi_protect(const std::string& plain) {
     DATA_BLOB in{DWORD(plain.size()), reinterpret_cast<BYTE*>(const_cast<char*>(plain.data()))}, out{};

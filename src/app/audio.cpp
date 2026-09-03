@@ -28,9 +28,23 @@ typedef void (*fn_close)(void* h);
 }  // namespace
 
 std::unique_ptr<AacEldDecoder> AacEldDecoder::create(std::string* why) {
-    const wchar_t* names[] = {L"libfdk-aac-2.dll", L"fdk-aac.dll", L"libfdk-aac.dll"};
     HMODULE lib = nullptr;
-    for (auto n : names) { lib = LoadLibraryW(n); if (lib) break; }
+    {
+        // fdk-aac.dll bundled next to scshr.exe (tools/fetch_deps.ps1 / tools/package.ps1).
+        wchar_t exePath[MAX_PATH];
+        DWORD n = GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+        if (n > 0 && n < MAX_PATH) {
+            std::wstring p(exePath, n);
+            size_t slash = p.find_last_of(L"\\/");
+            if (slash != std::wstring::npos) {
+                p.resize(slash + 1);
+                p += L"fdk-aac.dll";
+                lib = LoadLibraryW(p.c_str());
+            }
+        }
+    }
+    const wchar_t* names[] = {L"libfdk-aac-2.dll", L"fdk-aac.dll", L"libfdk-aac.dll"};
+    for (auto n : names) { if (lib) break; lib = LoadLibraryW(n); }
     if (!lib) {
         // Common install locations (MSYS2 / scoop) — same search the reference uses.
         const char* dirs[] = {"C:\\msys64\\mingw64\\bin", "C:\\msys64\\ucrt64\\bin"};
@@ -40,7 +54,7 @@ std::unique_ptr<AacEldDecoder> AacEldDecoder::create(std::string* why) {
             if (up) { std::string p = std::string(up) + "\\scoop\\apps\\msys2\\current\\mingw64\\bin\\libfdk-aac-2.dll"; lib = LoadLibraryA(p.c_str()); }
         }
     }
-    if (!lib) { if (why) *why = "libfdk-aac-2.dll not found (install: pacman -Sy mingw-w64-x86_64-fdk-aac under MSYS2); audio disabled"; return nullptr; }
+    if (!lib) { if (why) *why = "fdk-aac.dll not found next to scshr.exe (audio disabled)"; return nullptr; }
     auto open = reinterpret_cast<fn_open>(GetProcAddress(lib, "aacDecoder_Open"));
     auto cfg = reinterpret_cast<fn_configraw>(GetProcAddress(lib, "aacDecoder_ConfigRaw"));
     auto fill = GetProcAddress(lib, "aacDecoder_Fill");

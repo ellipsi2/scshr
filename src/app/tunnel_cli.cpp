@@ -1,11 +1,15 @@
 #include "app/tunnel_cli.h"
 
+#include "app/settings.h"
+#include "app/setup.h"
+#include "app/ssh_client.h"
 #include "common/log.h"
 #include "tunnel/win_tunnel.h"
 
 #include <windows.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <iostream>
@@ -108,12 +112,28 @@ int cmd_init(int argc, char** argv) {
     }
 
     if (server_code.empty()) server_code = prompt_server_code();
+    {
+        ServerDescriptor probe;
+        std::string why;
+        if (!decode_server(server_code, probe, why)) {
+            std::fprintf(stderr, "invalid macOS pairing code: %s\n", why.c_str());
+            return 2;
+        }
+    }
+
+    std::string report;
+    install_windows_tunnel(server_code, &report);
+    std::fputs(report.c_str(), stdout);
+    emit(out_path, report);
+    return 0;
+}
+}  // namespace
+
+// The privileged half of `scshr init`, shared with the pairing wizard (app/setup.cpp).
+std::string install_windows_tunnel(const std::string& server_code, std::string* report_out) {
     ServerDescriptor srv;
     std::string why;
-    if (!decode_server(server_code, srv, why)) {
-        std::fprintf(stderr, "invalid macOS pairing code: %s\n", why.c_str());
-        return 2;
-    }
+    if (!decode_server(server_code, srv, why)) throw std::runtime_error("invalid macOS pairing code: " + why);
 
     const Components comps = validate_components();
     bool identity_created = false;
@@ -182,10 +202,11 @@ int cmd_init(int argc, char** argv) {
     if (!have_status || status.last_handshake_unix == 0)
         report += "  the tunnel is installed and awaiting peer authorization on the Mac.\n";
     report += "\nGive this to the Mac:\n\n    sudo ./tools/scshr-macos-tunnel.sh pair '" + client_code + "'\n\n";
-    std::fputs(report.c_str(), stdout);
-    emit(out_path, report);
-    return 0;
+    if (report_out) *report_out = report;
+    return client_code;
 }
+
+namespace {
 
 int cmd_status() {
     // The pairing state and the WireGuard driver are readable only by SYSTEM and Administrators,
@@ -229,6 +250,115 @@ int cmd_status() {
     return audit.ok() && svc == ServiceState::Running ? 0 : 1;
 }
 
+// Same no-echo console read as `scshr --host … ` uses for the Screen Sharing password.
+std::string read_password_quietly() {
+    std::fprintf(stderr, "Mac account password: ");
+    HANDLE h = GetStdHandle(STD_INPUT_HANDLE);
+    DWORD mode = 0;
+    GetConsoleMode(h, &mode);
+    SetConsoleMode(h, mode & ~ENABLE_ECHO_INPUT);
+    std::string p;
+    std::getline(std::cin, p);
+    SetConsoleMode(h, mode);
+    std::fprintf(stderr, "\n");
+    while (!p.empty() && (p.back() == '\r' || p.back() == '\n')) p.pop_back();
+    return p;
+}
+
+std::string read_password_stdin() {
+    std::string line;
+    std::getline(std::cin, line);
+    while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
+    return line;
+}
+
+const char* kSetupUsage =
+    "scshr setup --mac HOST[:PORT] --mac-user USER [--password-stdin] [--endpoint HOST] [--listen-port P]\n"
+    "  Sets up both halves of the tunnel from here: signs in to the Mac over SSH, installs the macOS\n"
+    "  helper, builds the Windows tunnel, pairs the two and checks that Screen Sharing answers.\n"
+    "  --endpoint     public name or address the Mac should be reached at (default: the SSH host)\n"
+    "  --listen-port  UDP port the Mac's tunnel listens on (default 51820)\n";
+
+int cmd_setup(int argc, char** argv) {
+    SetupRequest req;
+    bool pw_stdin = false;
+    for (int i = 2; i < argc; ++i) {
+        const std::string k = argv[i];
+        if (k == "--mac" && i + 1 < argc) req.ssh_host = trim(argv[++i]);
+        else if (k == "--mac-user" && i + 1 < argc) req.ssh_user = trim(argv[++i]);
+        else if (k == "--endpoint" && i + 1 < argc) req.endpoint_override = trim(argv[++i]);
+        else if (k == "--listen-port" && i + 1 < argc) {
+            const long p = std::strtol(argv[++i], nullptr, 10);
+            if (p < 1 || p > 65535) { std::fprintf(stderr, "--listen-port must be 1..65535\n"); return 2; }
+            req.listen_port = uint16_t(p);
+        }
+        else if (k == "--password-stdin") pw_stdin = true;
+        else if (k == "-h" || k == "--help") { std::fputs(kSetupUsage, stdout); return 0; }
+        else { std::fprintf(stderr, "unknown argument for setup: %s\n", argv[i]); return 2; }
+    }
+    if (req.ssh_host.empty() || req.ssh_user.empty()) { std::fputs(kSetupUsage, stderr); return 2; }
+
+    // run_setup applies this only when --mac names the Mac the key was recorded for.
+    if (const auto prev = load_settings()) req.expected_hostkey = prev->ssh_hostkey_sha256;
+
+    req.password = pw_stdin ? read_password_stdin() : read_password_quietly();
+
+    SetupProgress pr;
+    pr.on_step = [](int n, int total, const std::string& title) {
+        std::printf("[%d/%d] %s\n", n, total, title.c_str());
+        std::fflush(stdout);
+    };
+    pr.on_log = [](const std::string& line) { std::printf("      %s\n", line.c_str()); std::fflush(stdout); };
+
+    const SetupOutcome r = run_setup(req, pr);
+    std::printf("\n%s\n", r.headline.c_str());
+    if (!r.detail.empty()) std::printf("%s\n", r.detail.c_str());
+    for (const auto& w : r.warnings) std::printf("note: %s\n", w.c_str());
+    return r.ok ? 0 : 1;
+}
+
+int cmd_check() {
+    if (!is_elevated()) {
+        std::puts("scshr check needs Administrator (the pairing state and the WireGuard driver are\n"
+                  "             restricted to SYSTEM and Administrators)");
+        return 1;
+    }
+    const LinkStatus s = check_link();
+    std::printf("scshr link\n");
+    std::printf("  set up          : %s\n", s.configured ? "yes" : "no");
+    std::printf("  tunnel service  : %s\n", s.service_running ? "running" : "not running");
+    std::printf("  handshake       : %s\n", s.handshake_recent ? "recent" : handshake_age(s.last_handshake_unix).c_str());
+    std::printf("  Mac answers ping: %s\n", s.peer_pings ? "yes" : "no");
+    std::printf("  screen sharing  : %s\n", s.screen_sharing_reachable ? s.rfb_banner.c_str() : "no answer");
+    if (!s.problem.empty()) std::printf("\n%s\n", s.problem.c_str());
+    return s.screen_sharing_reachable ? 0 : 1;
+}
+
+int cmd_unpair(int argc, char** argv) {
+    SetupRequest req;
+    bool have_mac = false, pw_stdin = false, reset = false;
+    for (int i = 2; i < argc; ++i) {
+        const std::string k = argv[i];
+        if (k == "--mac" && i + 1 < argc) { req.ssh_host = trim(argv[++i]); have_mac = true; }
+        else if (k == "--mac-user" && i + 1 < argc) req.ssh_user = trim(argv[++i]);
+        else if (k == "--password-stdin") pw_stdin = true;
+        else if (k == "--reset-identity") reset = true;
+        else if (k == "-h" || k == "--help") {
+            std::puts("scshr unpair [--mac HOST --mac-user USER [--password-stdin]] [--reset-identity]\n"
+                      "  Removes the tunnel from this PC (and from the Mac when --mac is given).");
+            return 0;
+        } else { std::fprintf(stderr, "unknown argument for unpair: %s\n", argv[i]); return 2; }
+    }
+    if (have_mac && req.ssh_user.empty()) { std::fprintf(stderr, "--mac also needs --mac-user\n"); return 2; }
+    if (have_mac) {
+        if (const auto prev = load_settings()) req.expected_hostkey = prev->ssh_hostkey_sha256;
+        req.password = pw_stdin ? read_password_stdin() : read_password_quietly();
+    }
+    for (const auto& line : run_unpair(have_mac ? &req : nullptr, reset)) std::printf("%s\n", line.c_str());
+    if (!reset) std::puts("identity keys preserved (use --reset-identity to discard them)");
+    return 0;
+}
+
 int cmd_tunnel(int argc, char** argv) {
     const std::string sub = argc > 2 ? argv[2] : "";
     if (sub == "uninstall") {
@@ -258,6 +388,9 @@ bool run_tunnel_command(int argc, char** argv, int& exit_code) {
     const std::string cmd = argv[1];
     try {
         if (cmd == "init") { exit_code = cmd_init(argc, argv); return true; }
+        if (cmd == "setup") { exit_code = cmd_setup(argc, argv); return true; }
+        if (cmd == "check") { exit_code = cmd_check(); return true; }
+        if (cmd == "unpair") { exit_code = cmd_unpair(argc, argv); return true; }
         if (cmd == "status") { exit_code = cmd_status(); return true; }
         if (cmd == "tunnel") { exit_code = cmd_tunnel(argc, argv); return true; }
     } catch (const std::exception& e) {

@@ -13,3 +13,12 @@ third_party/ffmpeg-*.zip
 third_party/wireguard/
 third_party/wireguard-nt-*.zip
 third_party/wireguard-windows/
+third_party/libssh2/
+third_party/fdk-aac/
+third_party/mac/
+third_party/go/
+third_party/*.tar.gz
+third_party/*.zip
+
+# packaged by tools/package.ps1
+dist/

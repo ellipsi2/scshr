@@ -14,4 +14,10 @@ bool run_tunnel_command(int argc, char** argv, int& exit_code);
 // Throws std::runtime_error (fail closed) rather than falling back to a public address.
 std::string resolve_session_host(const std::string& requested_host, bool direct);
 
+// Installs or reconciles the Windows half of the tunnel from a macOS SCST1 code (identity, conf,
+// service, route audit with rollback) and returns the SCCL1 code for the Mac. Requires an elevated
+// process; throws std::runtime_error with a redacted message on failure. `report`, if given,
+// receives the same human-readable summary `scshr init` prints.
+std::string install_windows_tunnel(const std::string& server_code, std::string* report);
+
 }  // namespace scshr::app

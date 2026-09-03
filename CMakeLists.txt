@@ -46,6 +46,19 @@ set_target_properties(ffmpeg::swscale PROPERTIES
   IMPORTED_LOCATION "${FFMPEG_ROOT}/bin/swscale-10.dll"
   INTERFACE_INCLUDE_DIRECTORIES "${FFMPEG_ROOT}/include")
 
+# libssh2 (static, OpenSSL backend) — pairing wizard only. Built by tools/fetch_deps.ps1.
+set(LIBSSH2_ROOT "${CMAKE_SOURCE_DIR}/third_party/libssh2" CACHE PATH "libssh2 static install (include/ + lib/libssh2.lib)")
+if(NOT EXISTS "${LIBSSH2_ROOT}/lib/libssh2.lib")
+  message(WARNING "libssh2 missing: ${LIBSSH2_ROOT}/lib/libssh2.lib (run tools/fetch_deps.ps1); scshr.exe will not link")
+endif()
+add_library(libssh2::libssh2 STATIC IMPORTED)
+set_target_properties(libssh2::libssh2 PROPERTIES
+  IMPORTED_LOCATION "${LIBSSH2_ROOT}/lib/libssh2.lib"
+  INTERFACE_INCLUDE_DIRECTORIES "${LIBSSH2_ROOT}/include")
+
+# fdk-aac (shared DLL, built from source with MSVC by tools/fetch_deps.ps1) — AAC-ELD audio.
+set(FDKAAC_DLL "${CMAKE_SOURCE_DIR}/third_party/fdk-aac/bin/fdk-aac.dll" CACHE FILEPATH "fdk-aac.dll to bundle")
+
 add_library(openssl::crypto SHARED IMPORTED)
 set_target_properties(openssl::crypto PROPERTIES
   IMPORTED_IMPLIB "${OPENSSL_ROOT}/lib/VC/x64/MD/libcrypto.lib"
@@ -98,11 +111,48 @@ add_library(scshr_media STATIC
 )
 target_link_libraries(scshr_media PUBLIC scshr_core ffmpeg::avcodec ffmpeg::avutil ffmpeg::swscale d3d11 dxgi dxguid d3dcompiler user32 gdi32 ole32 avrt)
 
-add_executable(scshr src/app/main.cpp src/app/window.cpp src/app/input.cpp src/app/keyboard_hook.cpp src/app/local_clipboard.cpp
-               src/app/tunnel_cli.cpp src/tunnel/win_tunnel.cpp)
-target_link_libraries(scshr PRIVATE scshr_media shell32 shcore winmm iphlpapi crypt32 advapi32)
+# ── application pieces shared by scshr.exe and the tests (everything but main/gui/viewer) ──
+add_library(scshr_app STATIC
+  src/app/tunnel_cli.cpp
+  src/app/settings.cpp
+  src/app/ssh_client.cpp
+  src/app/setup.cpp
+  src/tunnel/win_tunnel.cpp
+)
+target_link_libraries(scshr_app PUBLIC scshr_core libssh2::libssh2 shell32 shcore iphlpapi crypt32 advapi32 ole32)
 # WireGuardNT's adapter API header: status is read from the driver, not a userspace-API pipe.
-target_include_directories(scshr PRIVATE "${CMAKE_SOURCE_DIR}/third_party/wireguard")
+target_include_directories(scshr_app PUBLIC "${CMAKE_SOURCE_DIR}/third_party/wireguard")
+
+# GUI subsystem (no console flashes for double-click launches); CLI use re-attaches to the parent
+# console (see src/app/main.cpp). comctl32 v6 + per-monitor DPI + requireAdministrator come from
+# the manifest embedded through scshr.rc.
+add_executable(scshr WIN32
+  src/app/main.cpp src/app/viewer.cpp src/app/gui.cpp
+  src/app/window.cpp src/app/input.cpp src/app/keyboard_hook.cpp src/app/local_clipboard.cpp
+  src/app/scshr.rc)
+target_link_libraries(scshr PRIVATE scshr_media scshr_app comctl32 winmm)
+# The process manifest is embedded by scshr.rc (RT_MANIFEST 1); stop the linker from adding a second one.
+target_link_options(scshr PRIVATE /ENTRY:mainCRTStartup /MANIFEST:NO)
+
+# macOS helper bundle (script + Go tunnel daemon for arm64/amd64), uploaded to the Mac by the wizard.
+set(MAC_HELPER_DIR "${CMAKE_SOURCE_DIR}/third_party/mac")
+set(MAC_HELPER_FILES
+  "${CMAKE_SOURCE_DIR}/tools/scshr-macos-tunnel.sh"
+  "${MAC_HELPER_DIR}/scshr-tunnel-darwin-arm64"
+  "${MAC_HELPER_DIR}/scshr-tunnel-darwin-amd64")
+if(EXISTS "${MAC_HELPER_DIR}/scshr-tunnel-darwin-arm64" AND EXISTS "${MAC_HELPER_DIR}/scshr-tunnel-darwin-amd64")
+  add_custom_command(TARGET scshr POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:scshr>/mac"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${MAC_HELPER_FILES} "$<TARGET_FILE_DIR:scshr>/mac")
+else()
+  message(WARNING "macOS tunnel helper missing under ${MAC_HELPER_DIR}: run tools/fetch_deps.ps1 (cross-compiles tools/mac-tunnel with Go); the mac/ bundle will not be staged")
+endif()
+if(EXISTS "${FDKAAC_DLL}")
+  add_custom_command(TARGET scshr POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different "${FDKAAC_DLL}" $<TARGET_FILE_DIR:scshr>)
+else()
+  message(WARNING "fdk-aac.dll missing (${FDKAAC_DLL}): audio will be disabled at runtime until tools/fetch_deps.ps1 has built it")
+endif()
 
 # Bundled WireGuard components (pinned; see third_party/README.md). Copied next to scshr.exe so the
 # tunnel service can load them from the executable directory.
@@ -128,8 +178,8 @@ add_executable(scshr_vectors tools/vectors.cpp)
 target_link_libraries(scshr_vectors PRIVATE scshr_core)
 
 # ── tests ─────────────────────────────────────────────────────────────────
-add_executable(scshr_tests tests/test_main.cpp tests/test_crypto.cpp tests/test_protocol.cpp tests/test_media.cpp tests/test_tunnel.cpp)
-target_link_libraries(scshr_tests PRIVATE scshr_core)
+add_executable(scshr_tests tests/test_main.cpp tests/test_crypto.cpp tests/test_protocol.cpp tests/test_media.cpp tests/test_tunnel.cpp tests/test_setup.cpp)
+target_link_libraries(scshr_tests PRIVATE scshr_app)
 enable_testing()
 add_test(NAME unit COMMAND scshr_tests)
 

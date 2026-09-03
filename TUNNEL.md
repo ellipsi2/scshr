@@ -16,9 +16,16 @@ NATs or acts as an exit node. The only routes installed are:
 
 ## Setup
 
+The built-in wizard (`scshr.exe` → **Set up**, or `scshr setup --mac HOST --mac-user USER`) does every step
+below from Windows over SSH: it uploads the `mac/` helper bundle, runs `preflight` / `init` / `pair` /
+`enable-screen-sharing` through `sudo -S` (password on stdin, never on a command line or in a log),
+installs the Windows half, then verifies the handshake (ICMP to the peer) and the RFB banner on TCP 5900
+through the tunnel. The SSH host key is pinned on first use (SHA-256 in the settings file) and a later
+mismatch aborts before authentication. The manual exchange remains available:
+
 ```bash
 # macOS
-sudo ./tools/scshr-macos-tunnel.sh init --endpoint my-mac.example.net
+sudo ./mac/scshr-macos-tunnel.sh init --endpoint my-mac.example.net
 # → SCST1:<server-code>
 ```
 
@@ -61,8 +68,14 @@ If the Mac is behind NAT, forward `udp/51820` to it. Nothing else needs to be re
 
 Re-running `scshr init` reconciles the existing configuration and never rotates the identity.
 
-**macOS** (`tools/scshr-macos-tunnel.sh`): identity, configuration, `wg-quick` lifecycle, a LaunchDaemon
-for reboot recovery, the mandatory PF isolation anchor, status and uninstall.
+**macOS** (`tools/scshr-macos-tunnel.sh` + `tools/mac-tunnel`, shipped as the `mac/` folder): self-contained
+on a stock Mac — bash 3.2, no Homebrew. `scshr-tunnel-darwin-{arm64,amd64}` is a static Go binary
+(wireguard-go in userspace) that generates keys, validates the configuration (fail closed: one `/32`
+peer inside `10.77.77.0/24`, no DNS/MTU/Table/Endpoint keys), runs the tunnel in the foreground and
+answers `status` over its UAPI socket `/var/run/wireguard/scshr.sock`. The script owns identity,
+settings, configuration, the LaunchDaemon (`net.scshr.tunnel`, KeepAlive, runs `<script> run`, which
+activates PF first and refuses to start the tunnel otherwise), the mandatory PF isolation anchor,
+`preflight` / `enable-screen-sharing` for the wizard, status and uninstall.
 
 ## Screen Sharing isolation (mandatory)
 
@@ -110,12 +123,16 @@ SYSTEM + Administrators) and query the WireGuardNT driver, so both need an eleva
 ```
 
 ```bash
-sudo ./tools/scshr-macos-tunnel.sh status
-sudo ./tools/scshr-macos-tunnel.sh uninstall [--reset-identity]
+sudo /usr/local/libexec/scshr-macos-tunnel.sh status
+sudo /usr/local/libexec/scshr-macos-tunnel.sh uninstall [--reset-identity]
 ```
 
+`scshr unpair` (or the GUI's **Remove**) removes the Windows half and, given the Mac's administrator
+password, runs the Mac-side `uninstall` over SSH as well.
+
 Uninstall removes only scshr-owned state: our service/interface, our config, our PF anchor and the two
-lines it added to `/etc/pf.conf`, our LaunchDaemon. Other WireGuard tunnels, other PF anchors and the
+lines it added to `/etc/pf.conf`, our LaunchDaemon, the installed helper and script under
+`/usr/local/libexec`, and on Windows the settings file and the remembered Screen Sharing password. Other WireGuard tunnels, other PF anchors and the
 WireGuard software itself are never touched. Identity keys are preserved unless `--reset-identity`.
 
 ## Pairing descriptors
@@ -145,7 +162,11 @@ bash tests/tunnel_shell_test.sh            # macOS script: syntax, config/PF gol
 ```
 
 `tests/tunnel_shell_test.sh` compares the shell encoder's `SCST1`/`SCCL1` output against the same
-golden strings the C++ encoder is checked against, so the two implementations verify each other.
+golden strings the C++ encoder is checked against, so the two implementations verify each other. It also
+checks the LaunchDaemon plist golden, the `preflight` key set the Windows parser expects, and that the
+script depends on neither wireguard-tools nor bash 4. `go test ./tools/mac-tunnel` covers the helper's
+configuration parser/validator and UAPI rendering; `scshr_tests setup` covers the Windows-side parsing
+(SCST1 extraction from script output, preflight, settings, SSH host syntax).
 
 ## Deferred real-Mac validation
 
@@ -173,6 +194,21 @@ real hardware before this is considered working end to end:
 19. 1080p60 ten-minute soak over the tunnel.
 20. Emulated ~30 / 60 / 100 ms RTT.
 21. Representative Korea↔Japan jitter and loss.
+22. The wizard end to end from a non-elevated desktop: UAC prompt, SSH password and keyboard-interactive
+    authentication against macOS sshd, SCP upload, every `sudo -S` step, host-key pin persisted and a
+    changed key refused.
+23. `launchctl load -w` of `net.scshr.tunnel` and of `com.apple.screensharing` on macOS 14 and 15
+    (bootstrap semantics, already-loaded case, behaviour when Screen Sharing was never enabled in the GUI).
+24. The Go helper on a real utun: `ifconfig … alias`, `route add -interface`, UAPI socket creation under
+    `/var/run/wireguard`, SIGTERM teardown, restart by KeepAlive after a crash.
+25. macOS Application Firewall simply *on* (not only "block all incoming"/stealth): `init` registers the
+    helper with `socketfilterfw --add/--unblockapp`; confirm UDP 51820 reaches the daemon with the firewall
+    on, and that `uninstall`'s `--remove` leaves no entry behind.
+27. Re-running `init`/`pair` while the daemon is up: the script waits for the old helper to release
+    `/var/run/wireguard/scshr.sock` before reloading; confirm no "unix socket in use" restart loop.
+28. A cancelled or failed wizard run after `init`: the Mac must be rolled back (`uninstall` over the same
+    SSH session) so other Screen Sharing clients are not left blocked.
+26. `fdk-aac.dll` decoding live AAC-ELD-SBR audio (only synthetic data has been through the decoder path).
 
 MTU is left at the platform default. Any explicit MTU change must be treated as provisional until
 item 21 has been measured on a real WAN.
