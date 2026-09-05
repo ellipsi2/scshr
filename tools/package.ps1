@@ -82,10 +82,13 @@ if (Test-Path $zip) { Remove-Item -Force $zip }
 Compress-Archive -Path $stage -DestinationPath $zip -Force   # zip root = the scshr-<version>-win64 folder
 
 # SHA-256 of the zip and of every staged file, in the usual `sha256sum` layout.
+# (Get-FileHash is not available on every host, so hash via .NET.)
 $sums = Join-Path $stageRoot "SHA256SUMS.txt"
+$sha = [System.Security.Cryptography.SHA256]::Create()
 $items = @(Get-Item $zip) + @(Get-ChildItem -Recurse -File $stage)
 $lines = foreach ($item in $items) {
-  $h = (Get-FileHash $item.FullName -Algorithm SHA256).Hash.ToLower()
+  $fs = [System.IO.File]::OpenRead($item.FullName)
+  try { $h = [System.BitConverter]::ToString($sha.ComputeHash($fs)).Replace("-", "").ToLower() } finally { $fs.Dispose() }
   $name = $item.FullName.Substring($stageRoot.Length + 1) -replace '\\', '/'
   "$h  $name"
 }
