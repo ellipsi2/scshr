@@ -224,7 +224,7 @@ ViewerResult run_viewer(ViewerOptions& a) {
     };
     views.push_back(std::make_unique<View>());
     View& primary = *views.front();
-    primary.window = std::make_unique<Window>(L"scshr — connecting to " + widen(label) + L"…", win_w, win_h, make_events(&primary));
+    primary.window = std::make_unique<Window>(L"scshr — " + widen(label) + L" — Connecting…", win_w, win_h, make_events(&primary));
     Window* window = primary.window.get();
     int primary_id = 0;
 
@@ -290,7 +290,9 @@ ViewerResult run_viewer(ViewerOptions& a) {
     const int ntiles = session->num_tiles();
     LOG_INFO("app", "session ready: canvas=%dx%d scaled=%dx%d server=%dx%d tiles=%d decoder=%s pixfmt=%s", cw0, ch0, sw0, sh0, session->server_dims().first, session->server_dims().second, ntiles, session->decoder_name().c_str(), session->decoder()->pix_fmt_name().c_str());
     renderer.set_canvas(cw0, ch0, ntiles);
-    window->set_title(L"scshr — " + widen(label));
+    // Title = connection status; refreshed once a second in the render loop (title_for_status below).
+    std::wstring primary_title_prefix = L"scshr — " + widen(label);
+    window->set_title(primary_title_prefix + L" — Connected");
     if (!dynamic) window->lock_aspect(sc.advertise.width, sc.advertise.height);
     if (a.grab) { hook = std::make_unique<KeyboardHook>(window->hwnd(), [&](bool d, uint32_t ks) { session->key_event(d, ks); }); if (window->focused()) hook->enable(); }
     renderer.set_cursor_scale(float(sc.advertise.hidpi_scale));
@@ -304,6 +306,7 @@ ViewerResult run_viewer(ViewerOptions& a) {
     const int64_t t_start = now_ns();
     const int64_t deadline = a.auto_quit > 0 ? t_start + int64_t(a.auto_quit) * 1000000000LL : INT64_MAX;
     int64_t last_stats = t_start, cpu_wall = 0; uint64_t cpu_time = 0;
+    int64_t last_title = 0; uint64_t last_presents = 0, last_vbytes = 0, last_abytes = 0; std::wstring last_title_text;
     int cur_adv_w = win_w, cur_adv_h = win_h; std::optional<std::pair<int, int>> pending_size; int64_t pending_since = 0, last_resize = 0;
     bool os_cursor_hidden = false;
     bool dynamic_active = dynamic;
@@ -314,7 +317,7 @@ ViewerResult run_viewer(ViewerOptions& a) {
         if (closed) break;
         // Reap secondary windows the user closed.
         for (size_t i = 1; i < views.size();) { if (views[i]->window->closed()) { renderer.remove_window(views[i]->id); views.erase(views.begin() + ptrdiff_t(i)); } else ++i; }
-        if (!session->is_connected()) { LOG_ERROR("app", "connection lost — closing viewer"); connection_lost = true; break; }
+        if (!session->is_connected()) { LOG_ERROR("app", "connection lost — closing viewer"); window->set_title(primary_title_prefix + L" — Connection lost"); connection_lost = true; break; }
         if (renderer.device_lost()) break;
         // Cursor shape from the session thread → GPU texture on this thread.
         { std::lock_guard<std::mutex> lk(cursor_mu); if (have_pending_cursor) { have_pending_cursor = false; if (pending_cursor) { renderer.set_cursor_image(CursorImage{pending_cursor->w, pending_cursor->h, pending_cursor->hx, pending_cursor->hy, pending_cursor->rgba}); last_cursor = pending_cursor; cursor_dirty = true; } } }
@@ -343,7 +346,7 @@ ViewerResult run_viewer(ViewerOptions& a) {
                     // resolution is pinned (re-advertising the whole canvas to one window would distort the others).
                     dynamic_active = false;
                     renderer.set_crop(primary_id, CropRect{rects[0].x, rects[0].y, rects[0].w, rects[0].h});
-                    window->set_title(std::wstring(L"scshr — monitor 1"));
+                    primary_title_prefix = L"scshr — " + widen(label) + L" — monitor 1";
                     for (size_t i = 1; i < rects.size(); ++i) {
                         auto& r = rects[i];
                         auto v = std::make_unique<View>();
@@ -391,6 +394,35 @@ ViewerResult run_viewer(ViewerOptions& a) {
             }
             if (lost) break;
         }
+        // Title bar: connection status, once a second.
+        if (now_ns() - last_title >= 1000000000LL) {
+            const int64_t now = now_ns();
+            const uint64_t presents = renderer.telemetry().presents.load();
+            const uint64_t vbytes = session->rx_video_bytes(), abytes = session->rx_audio_bytes();
+            const double dt = last_title ? double(now - last_title) / 1e9 : 0.0;
+            const double fps = dt > 0 ? double(presents - last_presents) / dt : 0.0;
+            const double vkbps = dt > 0 ? double(vbytes - last_vbytes) * 8.0 / 1000.0 / dt : 0.0;
+            const double akbps = dt > 0 ? double(abytes - last_abytes) * 8.0 / 1000.0 / dt : 0.0;
+            last_title = now; last_presents = presents; last_vbytes = vbytes; last_abytes = abytes;
+            auto rate = [](double kbps) {
+                wchar_t b[32];
+                if (kbps >= 1000) swprintf(b, 32, L"%.1f Mbps", kbps / 1000.0); else swprintf(b, 32, L"%.0f kbps", kbps);
+                return std::wstring(b);
+            };
+            std::wstring t = primary_title_prefix + L" — Connected";
+            {
+                auto [cw, ch] = session->canvas_dims();
+                if (cw > 0 && ch > 0) t += L" · " + std::to_wstring(cw) + L"×" + std::to_wstring(ch);
+                const std::string codec = session->codec_name();   // "H.264/AVC" | "HEVC" | "unknown"
+                if (!codec.empty() && codec != "unknown") t += L" · " + widen(codec);
+                if (any_frame_ever) t += L" · " + std::to_wstring(int(fps + 0.5)) + L" fps";
+                if (dt > 0) t += L" · " + rate(vkbps) + L" video";
+                // Audio is listed only once it has actually arrived; without a sink, relay or permission it is
+                // simply absent from the title.
+                if (dt > 0 && abytes > 0) t += L" · " + rate(akbps) + L" audio";
+            }
+            if (t != last_title_text) { window->set_title(t); last_title_text = t; }
+        }
         // Periodic compact statistics.
         if (a.stats_interval > 0 && now_ns() - last_stats >= int64_t(a.stats_interval) * 1000000000LL) {
             last_stats = now_ns();
@@ -406,6 +438,7 @@ ViewerResult run_viewer(ViewerOptions& a) {
     if (hook) hook->disable();
     if (sink) sink->stop();
     session->close();
+    LOG_INFO("app", "session closed");
     if (connection_lost) return {ViewerExit::ConnectionLost, "The connection to " + label + " was lost.", 0};
     return {};
 }

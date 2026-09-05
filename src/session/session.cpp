@@ -535,6 +535,7 @@ void Session::ctrl_thread() {
         const bool rtcp = n >= 2 && (buf[0] & 0xC0) == 0x80 && (buf[1] & 0x7F) >= 64 && (buf[1] & 0x7F) <= 95;
         if (!rtcp) {
             ++rx_pkts_audio_;
+            rx_bytes_audio_ += uint64_t(n);
             if (!audio_dec_ || !aac_ || !on_audio) continue;
             RtpHeaderInfo h;
             if (!audio_dec_->decrypt(buf.data(), size_t(n), h)) continue;
@@ -580,6 +581,7 @@ void Session::session_audio_thread() {
         auto p = parse_session_audio_packet(ByteView(buf.data(), size_t(n)));
         if (!p) continue;
         ++rx_pkts_audio_;
+        rx_bytes_audio_ += uint64_t(n);
         if (++pkts == 1) LOG_INFO("audio", "session audio: receiving %u Hz PCM for account %s", p->sample_rate, cfg_.username.c_str());
         auto pcm = rs.to_48k(p->pcm.data(), p->pcm.size() / 2, p->sample_rate);
         if (!pcm.empty()) on_audio(pcm.data(), pcm.size() / 2);

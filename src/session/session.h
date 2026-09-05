@@ -121,6 +121,10 @@ public:
     std::function<void(const std::string&)> write_local_clipboard;
     std::function<void()> on_layout_changed;
 
+    // Cumulative received bytes (video RTP; audio = Apple's stream or the session-audio relay), for rate displays.
+    uint64_t rx_video_bytes() const { return rx_bytes_video_.load(); }
+    uint64_t rx_audio_bytes() const { return rx_bytes_audio_.load(); }
+
     SessionStats stats_snapshot();
     std::string telemetry_line();          // compact periodic statistics line
     uint64_t last_publish_ns() const { return uint64_t(last_publish_ns_.load()); }
@@ -243,6 +247,7 @@ private:
     std::vector<uint8_t> tcp_buf_;
     // audio
     struct AudioDecoder; std::unique_ptr<AudioDecoder> aac_;
+    std::atomic<uint64_t> rx_bytes_audio_{0};
     // recording
     FILE* rec_ = nullptr; std::mutex rec_mu_;
     static Session* active_;
