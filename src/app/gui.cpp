@@ -3,9 +3,11 @@
 //   run_gui() → (not paired) setup wizard → (paired) connect page → viewer → back to the connect page.
 //
 // Long-running work (setup over SSH, link checks) runs on a worker thread; the worker never touches a
-// window handle, it posts WM_APP messages and the dialog thread does the UI. Threads are always joined
-// before a dialog ends, and the wizard refuses to close while setup is still running.
+// window handle, it posts WM_APP messages and the dialog thread does the UI. Workers hold a reference
+// to their context, so a dialog may end while a link check is still running (the process exits without
+// waiting for it); the wizard itself refuses to close while a setup run is in progress.
 #include "app/gui.h"
+#include "common/log.h"
 
 #include "app/resource.h"
 #include "app/settings.h"
@@ -140,6 +142,7 @@ INT_PTR CALLBACK password_proc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp) {
 
 // ── setup wizard ──────────────────────────────────────────────────────────
 struct SetupCtx {
+    std::shared_ptr<SetupCtx> self;          // captured by the worker so a detached worker never dangles
     const Settings* previous = nullptr;      // prefill + previously pinned host key (may be null)
     std::thread worker;
     std::atomic<bool> cancel{false};
@@ -225,9 +228,10 @@ void setup_start(HWND dlg, SetupCtx& ctx) {
         PostMessageW(dlg, WM_SETUP_LOG, 0, LPARAM(new std::wstring(widen(line))));
     };
     prog.cancelled = [&ctx] { return ctx.cancel.load(); };
-    ctx.worker = std::thread([dlg, &ctx, prog] {
-        ctx.outcome = run_setup(ctx.req, prog);
-        PostMessageW(dlg, WM_SETUP_DONE, 0, 0);
+    auto keep = ctx.self;
+    ctx.worker = std::thread([dlg, keep, prog] {
+        keep->outcome = run_setup(keep->req, prog);
+        PostMessageW(dlg, WM_SETUP_DONE, 0, 0);   // harmless if the dialog is already gone
     });
 }
 
@@ -356,15 +360,22 @@ INT_PTR CALLBACK setup_proc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp) {
 
 // Returns IDOK when the Mac is paired and the user wants to go on, IDCANCEL to quit.
 int run_setup_dialog(HWND owner, const Settings* previous) {
-    SetupCtx ctx;
-    ctx.previous = previous;
-    const INT_PTR r = DialogBoxParamW(g_instance, MAKEINTRESOURCEW(IDD_SETUP), owner, setup_proc, LPARAM(&ctx));
-    if (ctx.worker.joinable()) ctx.worker.join();     // belt and braces: the dialog never ends while running
+    auto ctx = std::make_shared<SetupCtx>();
+    ctx->self = ctx;
+    ctx->previous = previous;
+    const INT_PTR r = DialogBoxParamW(g_instance, MAKEINTRESOURCEW(IDD_SETUP), owner, setup_proc, LPARAM(ctx.get()));
+    LOG_INFO("app", "setup dialog closed (%d)", int(r));
+    // The dialog does not end while a run is in progress (Cancel waits for the Mac to be rolled back),
+    // so the worker is normally finished here. If it is not, the window is gone and the user must not
+    // be left with an invisible process: let the worker finish on its own and go on exiting.
+    if (ctx->worker.joinable()) { ctx->cancel = true; ctx->worker.detach(); }
+    ctx->self.reset();   // a detached worker holds its own reference; otherwise this frees the context
     return r == IDOK ? IDOK : IDCANCEL;
 }
 
 // ── connect page ──────────────────────────────────────────────────────────
 struct ConnectCtx {
+    std::shared_ptr<ConnectCtx> self;        // captured by the background threads (see run_connect_dialog)
     Settings settings;
     std::thread checker;
     bool checking = false, status_ok = false, have_status = false;
@@ -389,7 +400,8 @@ void connect_start_check(HWND dlg, ConnectCtx& ctx) {
     EnableWindow(GetDlgItem(dlg, IDC_CONN_CHECK), FALSE);
     set_text(dlg, IDC_CONN_STATUS, std::wstring(L"Checking..."));
     InvalidateRect(GetDlgItem(dlg, IDC_CONN_STATUS), nullptr, TRUE);
-    ctx.checker = std::thread([dlg, &ctx] { ctx.link = check_link(); PostMessageW(dlg, WM_LINK_DONE, 0, 0); });
+    auto keep = ctx.self;
+    ctx.checker = std::thread([dlg, keep] { keep->link = check_link(); PostMessageW(dlg, WM_LINK_DONE, 0, 0); });
 }
 
 void connect_show_status(HWND dlg, ConnectCtx& ctx) {
@@ -477,8 +489,9 @@ void connect_remove(HWND dlg, ConnectCtx& ctx) {
     for (int id : kConnectControls) EnableWindow(GetDlgItem(dlg, id), FALSE);
     set_text(dlg, IDC_CONN_STATUS, std::wstring(L"Removing..."));
     InvalidateRect(GetDlgItem(dlg, IDC_CONN_STATUS), nullptr, TRUE);
-    ctx.unpairer = std::thread([dlg, &ctx] {
-        ctx.unpair_lines = run_unpair(ctx.unpair_with_mac ? &ctx.unpair_req : nullptr, false);
+    auto keep = ctx.self;
+    ctx.unpairer = std::thread([dlg, keep] {
+        keep->unpair_lines = run_unpair(keep->unpair_with_mac ? &keep->unpair_req : nullptr, false);
         PostMessageW(dlg, WM_UNPAIR_DONE, 0, 0);
     });
 }
@@ -562,11 +575,18 @@ INT_PTR CALLBACK connect_proc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 int run_connect_dialog(HWND owner, const Settings& s) {
-    ConnectCtx ctx;
-    ctx.settings = s;
-    const INT_PTR r = DialogBoxParamW(g_instance, MAKEINTRESOURCEW(IDD_CONNECT), owner, connect_proc, LPARAM(&ctx));
-    if (ctx.checker.joinable()) ctx.checker.join();
-    if (ctx.unpairer.joinable()) ctx.unpairer.join();
+    auto ctx = std::make_shared<ConnectCtx>();
+    ctx->self = ctx;
+    ctx->settings = s;
+    const INT_PTR r = DialogBoxParamW(g_instance, MAKEINTRESOURCEW(IDD_CONNECT), owner, connect_proc, LPARAM(ctx.get()));
+    LOG_INFO("app", "connect dialog closed (%d)", int(r));
+    // A link check (ICMP + RFB probe, up to ~7 s) may still be running: it holds its own reference to
+    // the context, so it is left to finish (or die with the process) instead of keeping a windowless
+    // process alive. Removing the pairing is different: it is mid-way through changing this PC and the
+    // Mac, and the dialog shows "Removing..." until it is done, so that one is waited for.
+    if (ctx->checker.joinable()) ctx->checker.detach();
+    if (ctx->unpairer.joinable()) ctx->unpairer.join();
+    ctx->self.reset();
     return int(r);
 }
 
@@ -578,6 +598,14 @@ void gui_message(const wchar_t* title, const std::wstring& text, bool error) {
 
 int run_gui(HINSTANCE instance) {
     g_instance = instance;
+    // The GUI has no console: keep a log where support can find it (shutdown stages included).
+    if (const wchar_t* la = _wgetenv(L"LOCALAPPDATA")) {
+        const std::wstring dir = std::wstring(la) + L"\\scshr";
+        CreateDirectoryW(dir.c_str(), nullptr);
+        // ponytail: fopen() takes an ANSI path, so a non-ASCII profile name gets no GUI log.
+        log_set_file(narrow(dir + L"\\scshr-gui.log"));
+        LOG_INFO("app", "scshr GUI started");
+    }
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     INITCOMMONCONTROLSEX icc{sizeof(INITCOMMONCONTROLSEX), ICC_STANDARD_CLASSES | ICC_PROGRESS_CLASS | ICC_BAR_CLASSES};
     InitCommonControlsEx(&icc);
@@ -596,6 +624,7 @@ int run_gui(HINSTANCE instance) {
         if (r != IDC_CONN_REMOVE) break;
     }
 
+    LOG_INFO("app", "GUI closed; exiting");
     CoUninitialize();
     return 0;
 }

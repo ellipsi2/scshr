@@ -9,6 +9,7 @@
 #include "app/gui.h"
 #include "app/tunnel_cli.h"
 #include "app/viewer.h"
+#include "common/log.h"
 #include "tunnel/win_tunnel.h"
 
 #include <shellapi.h>
@@ -39,8 +40,21 @@ void attach_parent_console() {
 
 }  // namespace
 
+// Once the last window is gone (or the CLI has printed its result) the process must end now. A normal
+// return would run every DLL's detach and every static destructor (FFmpeg, D3D11, WASAPI, WinSock,
+// OpenSSL) and wait for background threads; any of those can stall and leave scshr.exe alive with no
+// window. Everything that matters is already on disk, so flush what was written and stop the process.
+[[noreturn]] void exit_now(int rc) {
+    std::fflush(stdout);
+    std::fflush(stderr);
+    log_set_file("");   // closes the log file
+    TerminateProcess(GetCurrentProcess(), UINT(rc));
+    ExitProcess(UINT(rc));   // not reached
+}
+
 int main(int argc, char** argv) {
-    // Service entry point for the embedded WireGuard tunnel (see src/tunnel/win_tunnel.h).
+    // Service entry point kept for installs made before the service got its own host
+    // (scshr-tunnel.exe); the next Set up / `scshr init` re-points the service there.
     if (argc == 3 && std::string(argv[1]) == "/wireguard-service") {
         int wargc = 0;
         LPWSTR* wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
@@ -50,7 +64,7 @@ int main(int argc, char** argv) {
         return rc;
     }
 
-    if (argc == 1) return app::run_gui(GetModuleHandleW(nullptr));
+    if (argc == 1) exit_now(app::run_gui(GetModuleHandleW(nullptr)));
 
     attach_parent_console();
 
@@ -63,5 +77,5 @@ int main(int argc, char** argv) {
 
     const app::ViewerResult r = app::run_viewer(o);
     if (r.exit != app::ViewerExit::Closed && !r.error.empty()) std::fprintf(stderr, "scshr: %s\n", r.error.c_str());
-    return r.exit_code;
+    exit_now(r.exit_code);
 }
