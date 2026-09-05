@@ -4,6 +4,7 @@
 //   TCP control (record layer) ──────── tcp thread: cursor / layout / clipboard / misc-status
 //   UDP 5901 video (IOCP) ───────────── packet thread: SRTP → RTP seq → group assembly → NAL → decoder
 //   UDP 5900 audio+RTCP ─────────────── ctrl thread: SRTP audio → AAC-ELD → sink; SRTCP SR
+//   UDP →5902 session audio ─────────── session-audio thread: subscribe to the Mac's relay, PCM → sink
 //   tx thread (500 ms + wakeups) ────── heartbeat, RR/SR, NACK, FIR, LTR-ack pacing, stall watchdog, telemetry
 //
 // All queues are bounded; the decoder keeps one newest frame per tile; the render loop pulls.
@@ -42,6 +43,9 @@ struct SessionConfig {
     bool srp_first = true;
     negotiation::AdvertiseDims advertise;
     bool hdr = false, audio = true, curtain = true, share_console = false, alt_session = false, warmup_tcp = true;
+    // Apple's stream (`audio`) carries the whole Mac's sound and mutes the Mac. Session audio instead
+    // subscribes to the tunnel daemon's relay for `username`'s own processes (tools/mac-tunnel).
+    bool session_audio = false;
     std::string hidpi = "auto";
     int quality_tier = 0;
     std::string udp_bind_host;
@@ -132,6 +136,7 @@ private:
     // threads
     void packet_thread();
     void ctrl_thread();
+    void session_audio_thread();
     void tcp_thread();
     void tx_thread();
     void clipboard_thread();

@@ -6,6 +6,10 @@
 #include "media/packet_pool.h"
 #include "media/quality_gate.h"
 #include "media/rtp_assembler.h"
+#include "media/session_audio.h"
+
+#include <cmath>
+#include <cstring>
 
 using namespace scshr;
 
@@ -169,4 +173,37 @@ TEST(packet_pool_bounded) {
     CHECK_EQ(p.acquire(), UINT32_MAX);
     p.release(b); CHECK_EQ(p.acquire(), b);
     (void)a; (void)c; (void)d;
+}
+
+// ── session audio (PCM from the Mac's audio agent) ──────────────────────────
+TEST(session_audio_packet_parse) {
+    Bytes p{'S', 'C', 'A', 'U', 1, 2, 0x34, 0x12, 0x44, 0xAC, 0, 0, 2, 0, 0, 0,
+            0x00, 0x40, 0x00, 0xC0, 0xFF, 0x7F, 0x00, 0x80};   // seq 0x1234, 44100 Hz, 2 frames
+    auto r = parse_session_audio_packet(view(p));
+    CHECK(r.has_value());
+    if (r) {
+        CHECK_EQ(r->seq, uint16_t(0x1234)); CHECK_EQ(r->sample_rate, 44100u); CHECK_EQ(r->pcm.size(), size_t(4));
+        CHECK(std::fabs(r->pcm[0] - 0.5f) < 1e-6f); CHECK(std::fabs(r->pcm[1] + 0.5f) < 1e-6f);
+        CHECK(r->pcm[2] > 0.999f); CHECK(std::fabs(r->pcm[3] + 1.0f) < 1e-6f);
+    }
+    Bytes trunc(p.begin(), p.end() - 1);
+    CHECK(!parse_session_audio_packet(view(trunc)));
+    Bytes v2 = p; v2[4] = 2;
+    CHECK(!parse_session_audio_packet(view(v2)));
+    CHECK(!parse_session_audio_packet(view(std::string_view("SCAU1 status no-agent alice"))));
+}
+
+TEST(stereo_resampler_continuous_across_packets) {
+    StereoResampler rs;
+    std::vector<float> a, b;
+    for (int i = 0; i < 10; ++i) { a.push_back(float(i)); a.push_back(float(-i)); }
+    for (int i = 10; i < 20; ++i) { b.push_back(float(i)); b.push_back(float(-i)); }
+    auto o1 = rs.to_48k(a.data(), 10, 24000), o2 = rs.to_48k(b.data(), 10, 24000);
+    std::vector<float> all(o1); all.insert(all.end(), o2.begin(), o2.end());
+    CHECK_EQ(all.size() / 2, size_t(38));   // 20 in → 40 out minus the not-yet-known tail
+    bool ok = true;
+    for (size_t i = 0; i < all.size() / 2; ++i) if (std::fabs(all[i * 2] - 0.5f * float(i)) > 1e-4f || std::fabs(all[i * 2 + 1] + 0.5f * float(i)) > 1e-4f) ok = false;
+    CHECK(ok);   // a 24 kHz ramp becomes an unbroken 48 kHz ramp across the packet boundary
+    auto o3 = rs.to_48k(a.data(), 10, 48000);
+    CHECK_EQ(o3.size(), a.size());   // 48 kHz passes through untouched
 }

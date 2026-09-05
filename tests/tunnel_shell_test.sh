@@ -65,6 +65,15 @@ case "$plist" in
     *) bad "launchd_plist_keepalive" "the LaunchDaemon does not set KeepAlive" ;;
 esac
 
+# The session audio agent runs per GUI login session as that user, and only there.
+expect_file "audio_agent_plist_generation" "${gold}/net.scshr.audio.plist" \
+    "$("$sh" render-agent-plist /usr/local/libexec/scshr-tunnel)"
+agent_plist="$("$sh" render-agent-plist /usr/local/libexec/scshr-tunnel)"
+case "$agent_plist" in
+    *"<key>LimitLoadToSessionType</key><string>Aqua</string>"*) ok "audio_agent_plist_gui_only" ;;
+    *) bad "audio_agent_plist_gui_only" "the LaunchAgent is not limited to Aqua sessions" ;;
+esac
+
 # The Windows wizard parses exactly these keys out of `preflight`.
 expect_eq "preflight_keys" "macos_version
 arch

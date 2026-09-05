@@ -82,7 +82,7 @@ tunnel for development and replay work only.
 Options mirror the Python `iss` CLI: `--advertise WxH[@SCALE]|auto`, `--hidpi auto|on|off|N`,
 `--dynamic/--no-dynamic`, `--codec auto|hevc|avc`, `--decoder auto|sw`, `--curtain/--no-curtain`,
 `--alt-session` (default: own virtual session; falls back to the console session when the host offers none) /
-`--share-console`, `--audio/--no-audio`, `--display N|all|combined`, `--record FILE.scshr`,
+`--share-console`, `--audio/--no-audio`, `--audio-source session|host`, `--display N|all|combined`, `--record FILE.scshr`,
 `--auto-quit-secs N`, `--stats-interval S`, `-v`, `--log-file PATH`. Added here: `--direct --host H`
 (bypass the tunnel; development only) and the `setup` / `check` / `unpair` / `init` / `status` / `tunnel uninstall`
 subcommands.
@@ -98,9 +98,27 @@ percentiles, AU→Present latency, zero-copy/GPU-copy/CPU-upload frame counters,
 
 ## Audio
 
-AAC-ELD-SBR is decoded with fdk-aac: `fdk-aac.dll`, built from the pinned upstream source by `tools/fetch_deps.ps1`
-and bundled next to `scshr.exe` (an MSYS2 `libfdk-aac-2.dll` is still found as a fallback). Output goes through
-WASAPI shared mode with a 40 ms jitter target. Without the DLL video runs and audio is skipped.
+Apple's High Performance mode sends the **whole Mac's** sound to the viewer and mutes the Mac's speakers, for every
+logged-in user at once, and the output device it follows is the system-wide default (changing it in one session
+changes it for everybody). scshr therefore has two sources (`--audio-source`, default `session`):
+
+* **`session`** — Apple's audio stream is switched off (sub-floor bitrate in the offer, so the host sends none) and
+  the sound of the *remote account's own processes* is taken instead: `scshr-tunnel audio-agent`, a LaunchAgent in
+  every GUI login session on the Mac (`/Library/LaunchAgents/net.scshr.audio.plist`, installed by `init`), creates a
+  CoreAudio process tap (macOS 14.2+) over the processes running as that account, `CATapMutedWhenTapped`, so they are
+  silent on the Mac while tapped; the PCM goes over a unix socket to a relay inside the root tunnel daemon, which
+  serves it on UDP `10.77.77.1:5902` (PF-guarded like the other ports) to the Windows client that subscribed with
+  that account name. The client sends `SCAU1 sub <account>` once a second and plays the int16 stereo packets
+  (resampled to 48 kHz) through the same WASAPI sink. The person at the Mac keeps their speakers and hears only
+  their own session; the remote user hears only theirs, on the Windows output device of their choice. The first
+  tap asks, inside the remote session, for the *System Audio Recording* permission — click Allow. Uid-based: the
+  remote and the local user must be different accounts (which a virtual-display session already requires).
+  The agent logs to `~/Library/Logs/scshr-audio.log`; `scshr-macos-tunnel.sh status` shows whether it is installed.
+* **`host`** — Apple's stream as before: AAC-ELD-SBR decoded with fdk-aac (`fdk-aac.dll`, built from the pinned
+  upstream source by `tools/fetch_deps.ps1` and bundled next to `scshr.exe`; an MSYS2 `libfdk-aac-2.dll` is still
+  found as a fallback). Without the DLL video runs and audio is skipped.
+
+Both go through WASAPI shared mode with a 40 ms jitter target.
 
 ## Tools
 
@@ -115,7 +133,7 @@ WASAPI shared mode with a 40 ms jitter target. Without the DLL video runs and au
 | `scshr_inputprobe` | connects a real session (no window) and injects synthetic pointer/key events so the host side can be watched with `log stream` — the tool that caught the dropped-control-message bug |
 | `tools/e2e.sh` | one-shot viewer + sender run with summary lines |
 | `tools/scshr-macos-tunnel.sh` | macOS identity/pairing/lifecycle + mandatory Screen Sharing PF isolation (bash 3.2, no Homebrew) |
-| `tools/mac-tunnel/` | Go: self-contained macOS tunnel daemon (wireguard-go) + keys/status, cross-compiled into `mac/` |
+| `tools/mac-tunnel/` | Go: self-contained macOS tunnel daemon (wireguard-go) + keys/status + the session audio relay and per-user audio agent (CoreAudio process tap via purego, no cgo), cross-compiled into `mac/` |
 | `tests/tunnel_shell_test.sh` | static tests for the macOS script (syntax, config/PF/plist goldens, strict descriptor decoding) |
 | `tools/package.ps1` | builds the distributable zip |
 

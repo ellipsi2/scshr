@@ -38,6 +38,9 @@ PF_ANCHOR_LINE="anchor \"${TUNNEL_NAME}\""
 PF_LOAD_LINE="load anchor \"${TUNNEL_NAME}\" from \"${PF_ANCHOR}\""
 LAUNCHD_LABEL="net.scshr.tunnel"
 LAUNCHD_PLIST="/Library/LaunchDaemons/${LAUNCHD_LABEL}.plist"
+# Session audio: one agent per GUI login session (see tools/mac-tunnel/audio_relay.go).
+AUDIO_AGENT_LABEL="net.scshr.audio"
+AUDIO_AGENT_PLIST="/Library/LaunchAgents/${AUDIO_AGENT_LABEL}.plist"
 INSTALLED_SCRIPT="/usr/local/libexec/scshr-macos-tunnel.sh"
 INSTALLED_HELPER="/usr/local/libexec/scshr-tunnel"
 TUNNEL_LOG="/var/log/scshr-tunnel.log"
@@ -50,9 +53,10 @@ HELPER=""    # set by find_helper
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # Mac-side ports scshr actually uses (src/session/session.h): TCP 5900 control/RFB record layer,
-# UDP 5900 audio + RTCP, UDP 5901 video. Screen Sharing itself listens on TCP 5900.
+# UDP 5900 audio + RTCP, UDP 5901 video, UDP 5902 the session audio relay in the tunnel daemon.
+# Screen Sharing itself listens on TCP 5900.
 SCSHR_TCP_PORTS="5900"
-SCSHR_UDP_PORTS="5900 5901"
+SCSHR_UDP_PORTS="5900 5901 5902"
 
 die() { printf 'scshr: %s\n' "$*" >&2; exit 1; }
 info() { printf 'scshr: %s\n' "$*"; }
@@ -197,6 +201,27 @@ render_plist() {   # <installed-script>
     printf '%s\n' '    <key>KeepAlive</key><true/>'
     printf '    <key>StandardOutPath</key><string>%s</string>\n' "$TUNNEL_LOG"
     printf '    <key>StandardErrorPath</key><string>%s</string>\n' "$TUNNEL_LOG"
+    printf '%s\n' '</dict>'
+    printf '%s\n' '</plist>'
+}
+
+# The session audio agent: launchd starts one per GUI login session, as that user. It only taps
+# audio while the Windows client is subscribed to that account. It logs to ~/Library/Logs/scshr-audio.log
+# itself (a shared StandardErrorPath would belong to whichever user logged in first).
+render_agent_plist() {   # <installed-helper>
+    printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>'
+    printf '%s\n' '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">'
+    printf '%s\n' '<plist version="1.0">'
+    printf '%s\n' '<dict>'
+    printf '    <key>Label</key><string>%s</string>\n' "$AUDIO_AGENT_LABEL"
+    printf '%s\n' '    <key>ProgramArguments</key>'
+    printf '%s\n' '    <array>'
+    printf '        <string>%s</string>\n' "$1"
+    printf '%s\n' '        <string>audio-agent</string>'
+    printf '%s\n' '    </array>'
+    printf '%s\n' '    <key>LimitLoadToSessionType</key><string>Aqua</string>'
+    printf '%s\n' '    <key>RunAtLoad</key><true/>'
+    printf '%s\n' '    <key>KeepAlive</key><true/>'
     printf '%s\n' '</dict>'
     printf '%s\n' '</plist>'
 }
@@ -416,6 +441,33 @@ install_launchd() {
     render_plist "$INSTALLED_SCRIPT" >"${LAUNCHD_PLIST}.tmp"
     install -m 644 -o root -g wheel "${LAUNCHD_PLIST}.tmp" "$LAUNCHD_PLIST"
     rm -f "${LAUNCHD_PLIST}.tmp"
+    mkdir -p "$(dirname "$AUDIO_AGENT_PLIST")"
+    render_agent_plist "$INSTALLED_HELPER" >"${AUDIO_AGENT_PLIST}.tmp"
+    install -m 644 -o root -g wheel "${AUDIO_AGENT_PLIST}.tmp" "$AUDIO_AGENT_PLIST"
+    rm -f "${AUDIO_AGENT_PLIST}.tmp"
+}
+
+# uids of every GUI login session currently on this Mac (the console and virtual-display sessions
+# alike): each runs its own loginwindow as that user.
+gui_session_uids() {
+    ps -axo uid=,comm= 2>/dev/null | awk '$2 ~ /\/loginwindow$/ && $1 != 0 {print $1}' | sort -u
+}
+
+# Users who are logged in right now do not get a new LaunchAgent until their next login, so
+# (re)start it in their sessions here. Users who log in later get it from launchd on login.
+audio_agent_reload() {
+    local uid
+    for uid in $(gui_session_uids); do
+        launchctl bootout "gui/${uid}/${AUDIO_AGENT_LABEL}" >/dev/null 2>&1 || true
+        launchctl bootstrap "gui/${uid}" "$AUDIO_AGENT_PLIST" >/dev/null 2>&1 || true
+    done
+}
+
+audio_agent_unload() {
+    local uid
+    for uid in $(gui_session_uids); do
+        launchctl bootout "gui/${uid}/${AUDIO_AGENT_LABEL}" >/dev/null 2>&1 || true
+    done
 }
 
 # Unloading returns as soon as launchd has signalled the job, but the old helper still holds the
@@ -620,6 +672,7 @@ cmd_init() {
     daemon_unload
     daemon_load
     wait_up || die "the tunnel did not come up within 30s — see ${TUNNEL_LOG}"
+    audio_agent_reload
 
     if [ "$(sysctl -n net.inet.ip.forwarding 2>/dev/null || echo 0)" != "0" ]; then
         info "NOTE: IP forwarding is enabled on this Mac by something else — scshr did not enable it and does not need it"
@@ -680,6 +733,7 @@ cmd_status() {
     pfctl -a "$TUNNEL_NAME" -s rules 2>/dev/null | sed 's/^/    /' || printf '    (anchor not loaded)\n'
     printf '  screen sharing  : %s\n' "$(screen_sharing_state)"
     printf '  launchd         : %s\n' "$([ -f "$LAUNCHD_PLIST" ] && echo installed || echo 'not installed')"
+    printf '  audio agent     : %s (sessions: %s)\n' "$([ -f "$AUDIO_AGENT_PLIST" ] && echo installed || echo 'not installed')" "$(gui_session_uids | tr '\n' ' ')"
     # Private key material is never printed.
 }
 
@@ -697,6 +751,11 @@ cmd_uninstall() {
         daemon_unload
         rm -f "$LAUNCHD_PLIST"
         info "removed ${LAUNCHD_PLIST}"
+    fi
+    if [ -f "$AUDIO_AGENT_PLIST" ]; then
+        audio_agent_unload
+        rm -f "$AUDIO_AGENT_PLIST"
+        info "removed ${AUDIO_AGENT_PLIST}"
     fi
     alf_remove_helper
     rm -f "$INSTALLED_SCRIPT" "$INSTALLED_HELPER"
@@ -727,6 +786,7 @@ Test helpers (no root, no side effects):
   $0 render-conf <private-key> <mac-ip> <port> [<peer-public-key> <peer-ip>]
   $0 render-pf <mac-ip> <win-ip> <listen-port>
   $0 render-plist <installed-script>
+  $0 render-agent-plist <installed-helper>
   $0 render-preflight-keys
   $0 render-server-code <public-key> <endpoint> <port> <mac-ip> <win-ip>
   $0 render-client-code <public-key> <win-ip>
@@ -747,6 +807,7 @@ case "${1:-}" in
     render-conf) shift; render_conf "$@" ;;
     render-pf) shift; render_pf "$@" ;;
     render-plist) shift; render_plist "${1:-$INSTALLED_SCRIPT}" ;;
+    render-agent-plist) shift; render_agent_plist "${1:-$INSTALLED_HELPER}" ;;
     render-preflight-keys) shift; render_preflight_keys ;;
     render-server-code) shift; render_server_code "$@" ;;
     render-client-code) shift; render_client_code "$@" ;;

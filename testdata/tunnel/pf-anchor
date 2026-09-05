@@ -3,8 +3,8 @@
 # Address-based on purpose: the utun interface number is not stable across boots.
 pass in quick proto udp from any to any port 51820 keep state
 pass in quick proto tcp from 127.0.0.1 to 127.0.0.1 port { 5900 } keep state
-pass in quick proto udp from 127.0.0.1 to 127.0.0.1 port { 5900 5901 } keep state
+pass in quick proto udp from 127.0.0.1 to 127.0.0.1 port { 5900 5901 5902 } keep state
 pass in quick proto tcp from 10.77.77.2 to 10.77.77.1 port { 5900 } keep state
-pass in quick proto udp from 10.77.77.2 to 10.77.77.1 port { 5900 5901 } keep state
+pass in quick proto udp from 10.77.77.2 to 10.77.77.1 port { 5900 5901 5902 } keep state
 block drop in quick proto tcp from any to any port { 5900 }
-block drop in quick proto udp from any to any port { 5900 5901 }
+block drop in quick proto udp from any to any port { 5900 5901 5902 }

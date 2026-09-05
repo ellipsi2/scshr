@@ -171,6 +171,10 @@ func runTunnel(c *conf) error {
 		return fmt.Errorf("recording the interface name failed: %w", err)
 	}
 	fmt.Printf("scshr-tunnel: listening on udp/%d\n", c.ListenPort)
+	// Session audio is optional: the tunnel stays up without it.
+	if err := startAudioRelay(c.Address); err != nil {
+		fmt.Printf("scshr-tunnel: session audio relay unavailable: %v\n", err)
+	}
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGTERM, syscall.SIGINT)

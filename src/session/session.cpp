@@ -4,6 +4,7 @@
 #include "common/log.h"
 #include "media/bitstream.h"
 #include "media/nalu.h"
+#include "media/session_audio.h"
 #include "protocol/auth.h"
 #include "protocol/offers.h"
 
@@ -37,6 +38,7 @@ constexpr uint32_t PACKET_POOL_SLOTS = 8192;      // 16 MiB; bounded — overflo
 constexpr uint32_t IOCP_DEPTH = 256;
 const uint8_t HEARTBEAT_PAYLOAD[4] = {0x00, 0x68, 0x34, 0x00};
 constexpr uint8_t AUDIO_PT = 101;
+constexpr uint16_t SESSION_AUDIO_PORT = 5902;   // the tunnel daemon's session audio relay (audio_relay.go)
 
 bool contains(const std::string& hay, const char* needle) { return hay.find(needle) != std::string::npos; }
 std::string lower(std::string s) { for (auto& c : s) c = char(tolower(uint8_t(c))); return s; }
@@ -293,6 +295,7 @@ InitialBurst Session::negotiate_and_burst() {
 void Session::spawn_threads() {
     threads_.emplace_back([this] { packet_thread(); });
     threads_.emplace_back([this] { ctrl_thread(); });
+    if (cfg_.session_audio && on_audio && !cfg_.replay_mode) threads_.emplace_back([this] { session_audio_thread(); });
     threads_.emplace_back([this] { tcp_thread(); });
     threads_.emplace_back([this] { tx_thread(); });
     if (cfg_.clipboard && read_local_clipboard) threads_.emplace_back([this] { clipboard_thread(); });
@@ -545,6 +548,43 @@ void Session::ctrl_thread() {
         if (!plain) continue;
         for (auto& [ssrc, mid32] : rtcp::parse_sr(view(*plain))) { std::lock_guard<std::mutex> lk(sr_mu_); server_sr_[ssrc] = {mid32, double(wall_time_ns()) / 1e9}; }
     }
+}
+
+// ── session-audio thread: the remote account's own sound from the Mac's relay ─
+// We send first (a subscribe every second), so the relay's packets count as return traffic for the
+// Windows firewall; the relay drops us 3 s after the last subscribe, and `bye` ends it at once.
+void Session::session_audio_thread() {
+    net::UdpSocket s;
+    try { s.bind(cfg_.udp_bind_host, 0, 1 << 20); }
+    catch (const std::exception& e) { LOG_WARN("audio", "session audio: %s", e.what()); return; }
+    const std::string sub = "SCAU1 sub " + cfg_.username;
+    StereoResampler rs;
+    std::vector<uint8_t> buf(2048);
+    std::string last_status;
+    uint64_t pkts = 0; int64_t last_sub = 0; bool warned = false;
+    const int64_t t0 = now_ns();
+    while (!stop_) {
+        const int64_t now = now_ns();
+        if (now - last_sub >= 1'000'000'000) { s.send_to(view(sub), dest_host_, SESSION_AUDIO_PORT); last_sub = now; ++tx_pkts_; }
+        const int n = s.recv(buf.data(), buf.size(), 200);
+        if (n <= 0) {
+            if (!pkts && last_status.empty() && !warned && now - t0 > 5'000'000'000LL) { warned = true; LOG_WARN("audio", "session audio: no reply from the Mac's relay on udp/%u (tunnel daemon older than this build, or --direct without the tunnel?)", SESSION_AUDIO_PORT); }
+            continue;
+        }
+        if (n > 6 && std::memcmp(buf.data(), "SCAU1 ", 6) == 0) {
+            std::string st(buf.begin() + 6, buf.begin() + n);
+            if (st != last_status) LOG_INFO("audio", "session audio relay: %s", st.c_str());
+            last_status = st;
+            continue;
+        }
+        auto p = parse_session_audio_packet(ByteView(buf.data(), size_t(n)));
+        if (!p) continue;
+        ++rx_pkts_audio_;
+        if (++pkts == 1) LOG_INFO("audio", "session audio: receiving %u Hz PCM for account %s", p->sample_rate, cfg_.username.c_str());
+        auto pcm = rs.to_48k(p->pcm.data(), p->pcm.size() / 2, p->sample_rate);
+        if (!pcm.empty()) on_audio(pcm.data(), pcm.size() / 2);
+    }
+    s.send_to(view(std::string_view("SCAU1 bye")), dest_host_, SESSION_AUDIO_PORT);
 }
 
 // ── TCP thread ──────────────────────────────────────────────────────────────

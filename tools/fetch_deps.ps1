@@ -159,8 +159,9 @@ $macArm = Join-Path $macDir "scshr-tunnel-darwin-arm64"
 $macAmd = Join-Path $macDir "scshr-tunnel-darwin-amd64"
 if (-not (Test-Path (Join-Path $macTunnelSrc "go.mod"))) {
   Write-Host "tools/mac-tunnel/go.mod not found; skipping macOS tunnel helper cross-compile"
-} elseif ((Test-Path $macArm) -and (Test-Path $macAmd)) {
-  Write-Host "macOS tunnel helper binaries already present"
+} elseif ((Test-Path $macArm) -and (Test-Path $macAmd) -and
+          -not (Get-ChildItem $macTunnelSrc -Include *.go, go.mod, go.sum -Recurse | Where-Object { $_.LastWriteTime -gt (Get-Item $macArm).LastWriteTime })) {
+  Write-Host "macOS tunnel helper binaries already present and newer than tools/mac-tunnel"
 } else {
   $goExe = Join-Path $tp "wireguard-windows\.deps\bin\go.exe"
   if (-not (Test-Path $goExe)) {

@@ -79,19 +79,25 @@ activates PF first and refuses to start the tunnel otherwise), the mandatory PF 
 
 ## Screen Sharing isolation (mandatory)
 
-The Mac-side ports scshr uses are TCP 5900 (control/RFB record layer), UDP 5900 (audio + RTCP) and
-UDP 5901 (video). A dedicated PF anchor `/etc/pf.anchors/scshr`, loaded from two appended lines in
+The Mac-side ports scshr uses are TCP 5900 (control/RFB record layer), UDP 5900 (audio + RTCP),
+UDP 5901 (video) and UDP 5902 (the session audio relay inside the tunnel daemon, bound to the tunnel
+address only). A dedicated PF anchor `/etc/pf.anchors/scshr`, loaded from two appended lines in
 `/etc/pf.conf`, allows them only from the tunnel peer:
 
 ```
 pass  in quick proto udp from any        to any        port 51820          # WireGuard, public
 pass  in quick proto tcp from 127.0.0.1  to 127.0.0.1  port { 5900 }       # local loopback
-pass  in quick proto udp from 127.0.0.1  to 127.0.0.1  port { 5900 5901 }
+pass  in quick proto udp from 127.0.0.1  to 127.0.0.1  port { 5900 5901 5902 }
 pass  in quick proto tcp from 10.77.77.2 to 10.77.77.1 port { 5900 }       # the paired peer
-pass  in quick proto udp from 10.77.77.2 to 10.77.77.1 port { 5900 5901 }
+pass  in quick proto udp from 10.77.77.2 to 10.77.77.1 port { 5900 5901 5902 }
 block drop in quick proto tcp from any to any port { 5900 }                # everyone else
-block drop in quick proto udp from any to any port { 5900 5901 }
+block drop in quick proto udp from any to any port { 5900 5901 5902 }
 ```
+
+The tunnel daemon also owns `/var/run/scshr-audio.sock` (mode 0666), where the per-user audio agents
+(`/Library/LaunchAgents/net.scshr.audio.plist`, `scshr-tunnel audio-agent`) connect; the relay trusts an
+agent's uid from `LOCAL_PEERCRED`, never from what it says, and only starts the agent whose uid matches the
+account the Windows peer subscribed with.
 
 Rules are address-based, never interface-based, because the `utunN` number is not stable.
 `/etc/pf.conf` is backed up before the edit, the whole ruleset is validated with `pfctl -n -f`
@@ -209,6 +215,14 @@ real hardware before this is considered working end to end:
 28. A cancelled or failed wizard run after `init`: the Mac must be rolled back (`uninstall` over the same
     SSH session) so other Screen Sharing clients are not left blocked.
 26. `fdk-aac.dll` decoding live AAC-ELD-SBR audio (only synthetic data has been through the decoder path).
+29. Session audio end to end (nothing of this has run on a real Mac yet): the LaunchAgent starting in a
+    virtual-display session (`launchctl bootstrap gui/<uid>` from `init` for already-logged-in users, RunAtLoad
+    for later logins); the CoreAudio process tap through purego (`CATapDescription` selectors, `tfmt` format,
+    the IOProc buffer layout); the *System Audio Recording* prompt appearing inside the remote session and the
+    silence-on-deny behaviour; `CATapMutedWhenTapped` really silencing the remote account on the Mac's speakers
+    and restoring it on stop; the console user's sound untouched; that Apple's own stream at the sub-floor bitrate
+    (`--no-audio` / `--audio-source session`) leaves the Mac's speakers alone; a 44.1 kHz tap resampled on
+    Windows; the relay rejecting a subscribe for an unknown account; PF passing udp/5902 only from the peer.
 
 MTU is left at the platform default. Any explicit MTU change must be treated as provisional until
 item 21 has been measured on a real WAN.

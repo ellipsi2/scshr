@@ -9,6 +9,7 @@
 //	scshr-tunnel check <conf>      → exit 0 if <conf> is a valid scshr tunnel configuration
 //	scshr-tunnel run <conf>        → run the tunnel in the foreground (launchd supervises it)
 //	scshr-tunnel status            → key=value status of the running tunnel
+//	scshr-tunnel audio-agent       → per-user session audio agent (a LaunchAgent; see audio_relay.go)
 //
 // Private key material is never printed except by genkey, which is the command that mints it.
 package main
@@ -44,9 +45,11 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: scshr-tunnel genkey|pubkey|check <conf>|run <conf>|status")
+		return fmt.Errorf("usage: scshr-tunnel genkey|pubkey|check <conf>|run <conf>|status|audio-agent")
 	}
 	switch args[0] {
+	case "audio-agent":
+		return cmdAudioAgent()
 	case "genkey":
 		return cmdGenkey()
 	case "pubkey":

@@ -93,6 +93,7 @@ void usage() {
               "  --advertise WxH[@SCALE]|auto   --hidpi auto|on|off|N   --dynamic / --no-dynamic   --hdr\n"
               "  --codec auto|hevc|avc   --decoder auto|sw   --tiles N   --no-ltrp\n"
               "  --curtain / --no-curtain   --alt-session (default: own virtual session) / --share-console   --audio / --no-audio\n"
+              "  --audio-source session|host   (session: only your account's sound, the Mac keeps its speakers; host: Apple's whole-Mac stream)\n"
               "  --present vsync|lowlat   --adapter N   --list-adapters   --display N|all|combined\n"
               "  --record FILE.scshr   --auto-quit-secs N   --stats-interval S   --no-clipboard   --no-grab\n"
               "  --drop-pct P (synthetic loss)   --headless   -v   -q   --log-file PATH");
@@ -112,6 +113,7 @@ bool parse_viewer_args(int argc, char** argv, ViewerOptions& a) {
         else if (k == "--curtain") a.curtain = true; else if (k == "--no-curtain") a.curtain = false;
         else if (k == "--share-console") { a.share_console = true; a.alt_session = false; } else if (k == "--alt-session") { a.alt_session = true; a.share_console = false; }
         else if (k == "--audio") a.audio = true; else if (k == "--no-audio") a.audio = false;
+        else if (k == "--audio-source") { a.audio_source = need(i); if (!bad && a.audio_source != "session" && a.audio_source != "host") { std::fprintf(stderr, "--audio-source must be session or host\n"); return false; } }
         else if (k == "--present") a.present = need(i); else if (k == "--adapter") a.adapter = atoi(need(i).c_str()); else if (k == "--list-adapters") a.list_adapters = true;
         else if (k == "--display") a.display = need(i); else if (k == "--record") a.record = need(i);
         else if (k == "--auto-quit-secs") a.auto_quit = atoi(need(i).c_str()); else if (k == "--stats-interval") a.stats_interval = atoi(need(i).c_str());
@@ -239,7 +241,10 @@ ViewerResult run_viewer(ViewerOptions& a) {
     sc.offer_codec = sc.codec == VideoCodec::Hevc ? offers::Codec::Both : offers::Codec::Avc;
     sc.tiles_per_frame = a.tiles > 0 ? a.tiles : offers::default_tiles_per_frame(sc.codec == VideoCodec::Hevc ? offers::Codec::Hevc : offers::Codec::Avc);
     sc.host = a.host; sc.port = a.port; sc.username = a.user; sc.password = a.password; sc.srp_first = a.srp;
-    sc.hdr = a.hdr; sc.audio = a.audio; sc.curtain = a.curtain; sc.share_console = a.share_console; sc.alt_session = a.alt_session; sc.hidpi = a.hidpi;
+    // Session audio (default) turns Apple's whole-Mac stream off (sub-floor audio bitrate) and takes only the
+    // remote account's sound from the tunnel daemon's relay, so the person at the Mac keeps their speakers.
+    sc.session_audio = a.audio && a.audio_source != "host";
+    sc.hdr = a.hdr; sc.audio = a.audio && !sc.session_audio; sc.curtain = a.curtain; sc.share_console = a.share_console; sc.alt_session = a.alt_session; sc.hidpi = a.hidpi;
     sc.dynamic_resolution = dynamic; sc.ltrp = a.ltrp; sc.prefer_hw = a.decoder != "sw"; sc.decoder_override = a.decoder == "sw" ? "sw" : "";
     sc.clipboard = a.clipboard; sc.legacy_cursor = a.legacy_cursor; sc.record_packets = a.record; sc.drop_pct = a.drop_pct; sc.gpu = gpu;
     if (replay) { sc.replay_mode = true; sc.replay_video_key = unhex(a.replay_key); sc.warmup_tcp = false; sc.clipboard = false; sc.audio = false; if (a.codec == "auto") { sc.codec = VideoCodec::Avc; sc.tiles_per_frame = a.tiles > 0 ? a.tiles : 1; } }
@@ -256,7 +261,11 @@ ViewerResult run_viewer(ViewerOptions& a) {
     session->read_local_clipboard = [] { return clipboard_read_text(); };
     session->write_local_clipboard = [](const std::string& s) { clipboard_write_text(s); };
     std::unique_ptr<AudioSink> sink;
-    if (a.audio && !replay) { std::string why; sink = AudioSink::create(&why); if (!sink) LOG_WARN("audio", "%s", why.c_str()); else session->on_audio = [&](const float* pcm, size_t frames) { sink->feed(pcm, frames); }; }
+    if (a.audio && !replay) {
+        std::string why; sink = AudioSink::create(&why);
+        if (!sink) LOG_WARN("audio", "%s", why.c_str());
+        else { session->on_audio = [&](const float* pcm, size_t frames) { sink->feed(pcm, frames); }; LOG_INFO("audio", "source: %s", sc.session_audio ? "session (this account's sound via the tunnel relay)" : "host (Apple's whole-Mac stream)"); }
+    }
 
     // Connect on a helper thread so the window stays responsive.
     std::atomic<int> conn_state{0}; std::string conn_error;

@@ -94,6 +94,7 @@ add_library(scshr_core STATIC
   src/media/rtp_assembler.cpp
   src/media/quality_gate.cpp
   src/media/burst.cpp
+  src/media/session_audio.cpp
   src/net/udp.cpp
   src/net/tcp.cpp
   src/tunnel/pairing.cpp
