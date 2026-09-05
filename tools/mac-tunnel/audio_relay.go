@@ -62,6 +62,7 @@ type relay struct {
 	clientUID uint32
 	lastSub   time.Time
 	active    *relayAgent
+	forwarded uint64 // audio packets sent to the current subscriber
 }
 
 func newRelay(lookupUID func(string) (uint32, error), send func(*net.UDPAddr, []byte), logf func(string, ...any)) *relay {
@@ -99,6 +100,7 @@ func (r *relay) onAgentFrame(a *relayAgent, kind byte, payload []byte) {
 	case frameAudio:
 		if r.active == a && r.client != nil {
 			r.send(r.client, payload)
+			r.forwarded++
 		}
 	case frameStatus:
 		text := strings.TrimSpace(string(payload))
@@ -115,8 +117,10 @@ func (r *relay) stopActiveLocked() {
 	if r.active != nil && r.active.started {
 		r.active.cmd(cmdStop)
 		r.active.started = false
+		r.logf("audio agent (uid %d) stopped after %d forwarded packet(s)", r.active.uid, r.forwarded)
 	}
 	r.active = nil
+	r.forwarded = 0
 }
 
 // parseSub returns the account of a "SCAU1 sub <account>" datagram, "" for "SCAU1 bye", or an error.

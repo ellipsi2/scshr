@@ -426,7 +426,11 @@ install_helper() {
     local arch bundled
     arch="$(helper_arch)" || die "unsupported CPU architecture: $(uname -m)"
     bundled="${SCRIPT_DIR}/scshr-tunnel-darwin-${arch}"
-    mkdir -p "$(dirname "$INSTALLED_HELPER")"
+    # The audio agent runs this binary as an ordinary user, so the directory must be traversable
+    # by everyone: a `mkdir -p` under a sudo with a restrictive umask left it 0700 on a real Mac and
+    # launchd then failed every agent with EX_CONFIG (seen on macOS 26.6 during the first live test).
+    install -d -m 755 -o root -g wheel "$(dirname "$INSTALLED_HELPER")"
+    chmod 755 "$(dirname "$INSTALLED_HELPER")"
     if [ -x "$bundled" ]; then
         install -m 755 -o root -g wheel "$bundled" "$INSTALLED_HELPER"
     elif [ ! -x "$INSTALLED_HELPER" ]; then
@@ -436,12 +440,12 @@ install_helper() {
 }
 
 install_launchd() {
-    mkdir -p "$(dirname "$INSTALLED_SCRIPT")"
+    install -d -m 755 -o root -g wheel "$(dirname "$INSTALLED_SCRIPT")"
     install -m 755 -o root -g wheel "$0" "$INSTALLED_SCRIPT"
     render_plist "$INSTALLED_SCRIPT" >"${LAUNCHD_PLIST}.tmp"
     install -m 644 -o root -g wheel "${LAUNCHD_PLIST}.tmp" "$LAUNCHD_PLIST"
     rm -f "${LAUNCHD_PLIST}.tmp"
-    mkdir -p "$(dirname "$AUDIO_AGENT_PLIST")"
+    install -d -m 755 -o root -g wheel "$(dirname "$AUDIO_AGENT_PLIST")"
     render_agent_plist "$INSTALLED_HELPER" >"${AUDIO_AGENT_PLIST}.tmp"
     install -m 644 -o root -g wheel "${AUDIO_AGENT_PLIST}.tmp" "$AUDIO_AGENT_PLIST"
     rm -f "${AUDIO_AGENT_PLIST}.tmp"
@@ -455,11 +459,25 @@ gui_session_uids() {
 
 # Users who are logged in right now do not get a new LaunchAgent until their next login, so
 # (re)start it in their sessions here. Users who log in later get it from launchd on login.
+# `bootout` returns before launchd has removed the service; a `bootstrap` issued in that window fails
+# (seen live: both agents gone after init). So wait for the label to disappear, then bootstrap, and
+# report a failure instead of hiding it.
 audio_agent_reload() {
-    local uid
+    local uid i
     for uid in $(gui_session_uids); do
-        launchctl bootout "gui/${uid}/${AUDIO_AGENT_LABEL}" >/dev/null 2>&1 || true
-        launchctl bootstrap "gui/${uid}" "$AUDIO_AGENT_PLIST" >/dev/null 2>&1 || true
+        if launchctl print "gui/${uid}/${AUDIO_AGENT_LABEL}" >/dev/null 2>&1; then
+            launchctl bootout "gui/${uid}/${AUDIO_AGENT_LABEL}" >/dev/null 2>&1 || true
+            i=0
+            while launchctl print "gui/${uid}/${AUDIO_AGENT_LABEL}" >/dev/null 2>&1 && [ "$i" -lt 50 ]; do
+                sleep 0.2
+                i=$((i+1))
+            done
+        fi
+        if launchctl bootstrap "gui/${uid}" "$AUDIO_AGENT_PLIST" >/dev/null 2>&1; then
+            info "audio agent started in the session of uid ${uid}"
+        else
+            info "WARNING: the audio agent could not be started in the session of uid ${uid} (it starts at that user's next login)"
+        fi
     done
 }
 

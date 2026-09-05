@@ -10,6 +10,7 @@
 //	scshr-tunnel run <conf>        → run the tunnel in the foreground (launchd supervises it)
 //	scshr-tunnel status            → key=value status of the running tunnel
 //	scshr-tunnel audio-agent       → per-user session audio agent (a LaunchAgent; see audio_relay.go)
+//	scshr-tunnel audio-tap-test [s] → tap this account's audio for s seconds and report (diagnostics)
 //
 // Private key material is never printed except by genkey, which is the command that mints it.
 package main
@@ -50,6 +51,8 @@ func run(args []string) error {
 	switch args[0] {
 	case "audio-agent":
 		return cmdAudioAgent()
+	case "audio-tap-test":
+		return cmdAudioTapTest(args[1:])
 	case "genkey":
 		return cmdGenkey()
 	case "pubkey":
