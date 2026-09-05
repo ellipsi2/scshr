@@ -15,8 +15,8 @@ LANGUAGE LANG_ENGLISH, SUBLANG_ENGLISH_US
 IDI_APP ICON "scshr.ico"
 
 VS_VERSION_INFO VERSIONINFO
-  FILEVERSION 0,4,0,0
-  PRODUCTVERSION 0,4,0,0
+  FILEVERSION 0,5,0,0
+  PRODUCTVERSION 0,5,0,0
   FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
   FILEFLAGS 0x0L
   FILEOS VOS_NT_WINDOWS32
@@ -28,11 +28,11 @@ BEGIN
         BLOCK "040904B0"
         BEGIN
             VALUE "FileDescription", "scshr screen sharing client"
-            VALUE "FileVersion",     "0.4.0.0"
+            VALUE "FileVersion",     "0.5.0.0"
             VALUE "InternalName",    "scshr"
             VALUE "OriginalFilename","scshr.exe"
             VALUE "ProductName",     "scshr"
-            VALUE "ProductVersion",  "0.4.0.0"
+            VALUE "ProductVersion",  "0.5.0.0"
         END
     END
     BLOCK "VarFileInfo"
