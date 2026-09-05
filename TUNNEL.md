@@ -60,7 +60,9 @@ If the Mac is behind NAT, forward `udp/51820` to it. Nothing else needs to be re
 * strictly decodes the `SCST1` descriptor,
 * renders `%ProgramData%\scshr\scshr.conf` with `AllowedIPs = 10.77.77.1/32` and no `DNS`, `Table` or `MTU`,
 * installs/reconciles the service `WireGuardTunnel$scshr` →
-  `scshr.exe /wireguard-service <conf>` → `tunnel.dll!WireGuardTunnelService`,
+  `scshr-tunnel.exe /wireguard-service <conf>` → `tunnel.dll!WireGuardTunnelService` (a separate,
+  tiny host next to `scshr.exe`, so the always-on service is not mistaken for a leftover `scshr.exe`
+  and does not lock the application binary; `init` restarts the service when its command line changes),
 * verifies afterwards that the peer address routes over the tunnel as a `/32`, that no default route
   is bound to the adapter, that public traffic still leaves over the normal network, and that the
   adapter publishes no DNS servers — rolling the installation back if any of that fails,
@@ -215,14 +217,26 @@ real hardware before this is considered working end to end:
 28. A cancelled or failed wizard run after `init`: the Mac must be rolled back (`uninstall` over the same
     SSH session) so other Screen Sharing clients are not left blocked.
 26. `fdk-aac.dll` decoding live AAC-ELD-SBR audio (only synthetic data has been through the decoder path).
-29. Session audio end to end (nothing of this has run on a real Mac yet): the LaunchAgent starting in a
-    virtual-display session (`launchctl bootstrap gui/<uid>` from `init` for already-logged-in users, RunAtLoad
-    for later logins); the CoreAudio process tap through purego (`CATapDescription` selectors, `tfmt` format,
-    the IOProc buffer layout); the *System Audio Recording* prompt appearing inside the remote session and the
-    silence-on-deny behaviour; `CATapMutedWhenTapped` really silencing the remote account on the Mac's speakers
-    and restoring it on stop; the console user's sound untouched; that Apple's own stream at the sub-floor bitrate
-    (`--no-audio` / `--audio-source session`) leaves the Mac's speakers alone; a 44.1 kHz tap resampled on
-    Windows; the relay rejecting a subscribe for an unknown account; PF passing udp/5902 only from the peer.
+29. Session audio. Verified on a real Mac (macOS 26.6, 2026-09-05): the LaunchAgent starts per GUI session
+    once `/usr/local/libexec` is traversable (it was 0700 on the first install → every agent died with
+    EX_CONFIG; fixed in `install_helper`); the CoreAudio process tap through purego works (`CATapDescription`
+    selectors, `tfmt` = 48 kHz float32 stereo interleaved, IOProc buffer layout, real PCM captured: peak 0.64,
+    RMS 0.07 while `say` spoke); `NSAutoreleasePool` must be drained on the creating OS thread (`LockOSThread`,
+    the drain crashed otherwise); the relay/agent handshake and `id -u` account lookup work; Apple's stream at the
+    sub-floor bitrate leaves the Mac's speakers alone (the console user kept hearing the remote session's sound
+    before the tap ran). The *System Audio Recording* prompt is **cancelled by tccd** (`auth_reason` 13,
+    PROMPT_CANCEL) in a screen-sharing virtual-display session because that session is off-console, and a denied
+    tap silently delivers zeros — the permission has to be switched on in System Settings inside the remote
+    session. Also verified live: `CATapMutedWhenTapped` silences the remote account on the Mac's speakers while the
+    tap is read (the console user stopped hearing the remote session), and coreaudiod applies a permission grant
+    only to a fresh client process (audio packets started leaving the Mac the moment the agent was restarted; the
+    agent now restarts itself after a silent tap, and rebuilds a tap whose IOProc never runs — seen in instances
+    started right after a predecessor was killed). Replacing the unsigned helper binary voids the TCC grant (row
+    rewritten to denied at the install time; the on-console user was re-prompted and had to click Allow again).
+    Verified end to end 2026-09-05 18:37 from the paired PC: 2965 packets forwarded, 1483 non-silent buffers, sound
+    heard on Windows, the console user no longer hearing the remote session. Added afterwards and not yet exercised
+    live: the permission dialog + Open Settings (osascript in the session), the standby tap between connections,
+    the restart-on-grant via `TCCAccessPreflight`. Still unverified: a 44.1 kHz tap resampled on Windows.
 
 MTU is left at the platform default. Any explicit MTU change must be treated as provisional until
 item 21 has been measured on a real WAN.

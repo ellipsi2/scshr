@@ -72,9 +72,16 @@ While connected:
   Alt as ⌥ (Option), Ctrl as ⌃ (Control).
 * Sound from *your* session on the Mac plays on this PC, through whatever output device Windows uses.
   The person sitting at the Mac keeps their own sound on the Mac's speakers, and the Mac's sound
-  settings stay theirs. The first time, the Mac asks (inside your session) whether *scshr-tunnel* may
-  record this computer's audio — click **Allow**; until then you hear nothing.
+  settings stay theirs. **One-time step:** the first time you connect, a dialog appears in the Mac's
+  screen asking for the recording permission. Click **Open Settings**, switch on **scshr-tunnel** under
+  *Screen & System Audio Recording*, and sound starts by itself a few seconds later. (macOS cannot show
+  its own permission prompt inside a remote session, which is why scshr asks this way.) The setting is
+  remembered for your account until scshr is updated on the Mac (**Set up** again): macOS then treats
+  the new helper as a new program and asks once more. Once allowed, your session stays silent on the
+  Mac's speakers even while you are not connected.
 * Text you copy on one side can be pasted on the other.
+* The title bar shows the connection: the Mac's resolution, codec, frame rate, and the video and
+  audio bitrates (audio appears once sound is arriving).
 * Close the window to disconnect. If the connection drops, scshr offers to reconnect.
 
 ## Removing scshr
@@ -104,6 +111,10 @@ sure `scshr-tunnel` is allowed.
 **Do I need to keep anything running on the Mac?** No. The helper starts by itself when the Mac
 boots.
 
+**Task Manager shows `scshr-tunnel.exe` while scshr is closed.** That is the private link (the Windows
+service `WireGuardTunnel$scshr`), which stays on so the Mac stays reachable. It is not the app; leave it
+running. Ending it disconnects the link until the service is started again (**Set up** does that).
+
 **Can two PCs share one Mac?** Not at the same time. Each PC needs its own setup, and setting up a
 second PC replaces the first.
 
@@ -111,12 +122,12 @@ second PC replaces the first.
 option you sign in with your account and work in your own session; the person at the Mac keeps their
 screen, mouse and keyboard. Your account must be different from the one already signed in at the Mac.
 
-**I hear nothing (or the Mac's speakers went quiet).** Sound from your session needs the Mac to have
-been set up with this version of scshr — click **Set up** again if it was set up with an older one — and
-needs macOS 14.2 or newer. If the Mac asked whether *scshr-tunnel* may record audio and you clicked
-**Don't Allow**, turn it on in *System Settings › Privacy & Security › Screen & System Audio Recording*
-on the Mac. The Mac's own speakers are never touched by scshr's default setting; if they went quiet, the
-older whole-Mac sound mode is in use (`--audio-source host` on the command line).
+**I hear nothing (or the person at the Mac hears my sound).** Inside your remote session on the Mac,
+switch on **scshr-tunnel** under *System Settings › Privacy & Security › Screen & System Audio Recording*
+(macOS does not show the permission prompt in a remote session). Also make sure the Mac was set up with
+this version of scshr — click **Set up** again if it was set up with an older one — and that it runs
+macOS 14.2 or newer. The Mac's own speakers are never touched by scshr's default setting; if they went
+quiet, the older whole-Mac sound mode is in use (`--audio-source host` on the command line).
 
 **Something else went wrong.** In the scshr window click **Check connection** and read the message.
 For deeper troubleshooting see `README.md` (technical) — the command line tools `scshr check` and

@@ -110,9 +110,26 @@ changes it for everybody). scshr therefore has two sources (`--audio-source`, de
   serves it on UDP `10.77.77.1:5902` (PF-guarded like the other ports) to the Windows client that subscribed with
   that account name. The client sends `SCAU1 sub <account>` once a second and plays the int16 stereo packets
   (resampled to 48 kHz) through the same WASAPI sink. The person at the Mac keeps their speakers and hears only
-  their own session; the remote user hears only theirs, on the Windows output device of their choice. The first
-  tap asks, inside the remote session, for the *System Audio Recording* permission — click Allow. Uid-based: the
+  their own session; the remote user hears only theirs, on the Windows output device of their choice. Uid-based: the
   remote and the local user must be different accounts (which a virtual-display session already requires).
+  **Permission:** the tap needs *System Audio Recording* for `scshr-tunnel`. macOS cannot show that prompt inside a
+  screen-sharing virtual-display session (the session is off-console; tccd logs `PROMPT_CANCEL`, and the tap then
+  delivers silence with no error), so it must be switched on by hand once, inside the remote session: *System
+  Settings › Privacy & Security › Screen & System Audio Recording › scshr-tunnel*. The entry appears after the first
+  connection attempt. When a subscriber arrives and the preflight (`TCCAccessPreflight`, read-only) says the grant
+  is missing, the agent shows a dialog in that session (osascript, which unlike tccd's own prompt is not cancelled
+  off-console) with an **Open Settings** button that opens the pane, then watches the preflight and restarts itself
+  the moment the grant appears. While the grant is present and the session is off-console, the agent keeps a
+  *standby* tap (mute only, nothing forwarded) between scshr connections, so the remote account's sound never
+  reaches the Mac's speakers; the standby ends when the session comes on console. The client also logs the hint
+  when a tap has run silently for a few seconds. coreaudiod
+  evaluates the permission once per client process (verified: zeros until the agent was restarted, audio right
+  after), so an agent whose tap stays silent exits and lets launchd relaunch it — after 12 s, doubling per
+  consecutive silent restart up to 5 min, reset by the first non-silent buffer — which makes a grant take effect
+  without reconnecting. **Unsigned code caveat (verified):** TCC identifies the unsigned helper by its content, so
+  every update of `scshr-tunnel` voids the grant (tccd re-prompts; off-console the prompt is cancelled and the row
+  flips to denied) and the switch has to be turned on again after each Set up. Signing the helper with a Developer
+  ID (a stable designated requirement) is what would make grants survive updates; ad-hoc signatures do not help.
   The agent logs to `~/Library/Logs/scshr-audio.log`; `scshr-macos-tunnel.sh status` shows whether it is installed.
 * **`host`** — Apple's stream as before: AAC-ELD-SBR decoded with fdk-aac (`fdk-aac.dll`, built from the pinned
   upstream source by `tools/fetch_deps.ps1` and bundled next to `scshr.exe`; an MSYS2 `libfdk-aac-2.dll` is still
