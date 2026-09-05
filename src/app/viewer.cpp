@@ -262,6 +262,7 @@ ViewerResult run_viewer(ViewerOptions& a) {
     std::atomic<int> conn_state{0}; std::string conn_error;
     std::thread conn([&] { try { session->connect(); conn_state = 1; } catch (const std::exception& e) { conn_error = e.what(); conn_state = 2; } });
     while (conn_state == 0 && !closed) { window->pump(); std::this_thread::sleep_for(std::chrono::milliseconds(10)); }
+    if (closed) session->cancel_connect();   // closing must not wait out the handshake's timeouts
     conn.join();
     if (closed) { session->close(); return {}; }
     if (conn_state == 2) { LOG_ERROR("app", "connect failed: %s", conn_error.c_str()); session->close(); return {ViewerExit::ConnectFailed, conn_error, 1}; }

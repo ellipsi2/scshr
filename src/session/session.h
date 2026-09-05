@@ -86,6 +86,9 @@ public:
     ~Session();
     void connect();                       // full handshake + burst + threads (throws on failure)
     void close();
+    // Aborts a connect() running on another thread (the viewer window was closed mid-handshake).
+    // Without it the caller has to wait out the handshake's timeouts — up to minutes.
+    void cancel_connect();
     bool is_connected() const { return connected_.load(); }
 
     VideoDecoder* decoder() { return decoder_.get(); }
@@ -170,7 +173,7 @@ private:
     std::string dest_host_;
     uint16_t ctrl_port_ = 0, video_port_ = 0;             // local bind ports
     uint16_t dest_ctrl_port_ = 0, dest_video_port_ = 0;   // where our RTCP / heartbeats go (== bind ports on Apple's symmetric layout)
-    std::atomic<bool> connected_{false}, stop_{false};
+    std::atomic<bool> connected_{false}, stop_{false}, cancel_{false};
     std::vector<std::thread> threads_;
     // transport
     std::unique_ptr<negotiation::Result> neg_;

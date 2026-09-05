@@ -26,7 +26,7 @@ void protocol_handshake(net::TcpSocket& sock) {
 }
 
 net::TcpSocket open_and_handshake(const Params& p) {
-    net::TcpSocket s = net::TcpSocket::connect(p.host, p.port, 15.0);
+    net::TcpSocket s = net::TcpSocket::connect(p.host, p.port, 15.0, p.cancelled);
     protocol_handshake(s);
     return s;
 }
@@ -234,8 +234,8 @@ Bytes build_0x1c(ByteView audio_offer, ByteView video_offer, const Keys& keys, b
     return buf;
 }
 
-void warmup_tcp(const std::string& host, uint16_t port, double dwell_s) {
-    net::TcpSocket s = net::TcpSocket::connect(host, port, 10.0);
+void warmup_tcp(const std::string& host, uint16_t port, double dwell_s, const std::function<bool()>& cancelled) {
+    net::TcpSocket s = net::TcpSocket::connect(host, port, 10.0, cancelled);
     s.set_timeout(5.0);
     protocol_handshake(s);
     s.close();
@@ -306,6 +306,7 @@ Result connect_and_negotiate(const Params& pin) {
     offers::CanvasDims cd = read_video_answer(sock, *cipher, leftover);
     for (int attempt = 0; (!cd.w || !cd.h) && attempt < DEGENERATE_RETRY_LIMIT; ++attempt) {
         sleep_s(DEGENERATE_RETRY_INTERVAL_S);
+        if (p.cancelled && p.cancelled()) throw std::runtime_error("the handshake was cancelled");
         sock.send_all(view(cipher->encrypt_message(view(msg_1c))));
         LOG_INFO("negotiation", "0x1c re-query %d/%d (degenerate canvas)", attempt + 1, DEGENERATE_RETRY_LIMIT);
         cd = read_video_answer(sock, *cipher, leftover);

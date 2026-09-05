@@ -37,6 +37,9 @@ struct Params {
     std::function<std::string(const std::string& console_user)> on_session_choice;  // "share_console"|"alt_session"
     Bytes audio_offer, video_offer;
     bool legacy_cursor = false;
+    // Polled during every blocking wait of the handshake; true aborts it with an exception. The
+    // handshake can otherwise sit in a single wait for a minute (the Mac's "Allow" popup).
+    std::function<bool()> cancelled;
 };
 
 struct Result {
@@ -51,6 +54,6 @@ struct Result {
 };
 
 Result connect_and_negotiate(const Params& p);
-void warmup_tcp(const std::string& host, uint16_t port, double dwell_s = 1.4);
+void warmup_tcp(const std::string& host, uint16_t port, double dwell_s = 1.4, const std::function<bool()>& cancelled = {});
 
 }  // namespace scshr::negotiation

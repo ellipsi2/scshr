@@ -82,6 +82,7 @@ void Session::connect() {
 }
 
 void Session::close() { stop_ = true; teardown(); connected_ = false; }
+void Session::cancel_connect() { cancel_ = true; }
 
 void Session::write_record(int kind, const uint8_t* data, size_t len, int64_t t) {
     if (!rec_) return;
@@ -110,9 +111,10 @@ void Session::connect_internal() {
     }
     // 2) Apple's two-TCP warmup.
     if (cfg_.warmup_tcp && !cfg_.replay_mode) {
-        try { negotiation::warmup_tcp(dest_host_, cfg_.port); }
+        try { negotiation::warmup_tcp(dest_host_, cfg_.port, 1.4, [this] { return cancel_.load(); }); }
         catch (const std::exception& e) { LOG_WARN("session", "warmup TCP failed (%s); continuing without it", e.what()); }
     }
+    if (cancel_) throw std::runtime_error("the connection was cancelled");
     // 3-6) Handshake + burst under a firewall-punch loop (media must count as established return traffic).
     std::atomic<bool> punch_stop{false};
     std::thread punch([&] { punch_thread(punch_stop); });
@@ -166,7 +168,8 @@ void Session::connect_internal() {
     }
     // 9b) Clipboard enable + prime.
     if (cfg_.clipboard && neg_) { send_ctrl(view(clip::build_auto_pasteboard_msg(1))); send_ctrl(view(clip::build_clipboard_request(false))); }
-    // 10) Threads.
+    // 10) Threads. A cancel that landed during the burst stops here, before anything long-lived starts.
+    if (cancel_) throw std::runtime_error("the connection was cancelled");
     stop_ = false;
     last_publish_ns_ = now_ns();
     snap_t_ns_ = now_ns();
@@ -190,7 +193,7 @@ InitialBurst Session::handshake_with_reconnect() {
         try { return negotiate_and_burst(); }
         catch (const BurstStarved& e) {
             last = e.what();
-            if (attempt + 1 >= BURST_RETRY_ATTEMPTS) break;
+            if (attempt + 1 >= BURST_RETRY_ATTEMPTS || cancel_) break;
             LOG_WARN("session", "burst starved (%s); full reconnect %d/%d", e.what(), attempt + 1, BURST_RETRY_ATTEMPTS);
             if (neg_) { neg_->sock.close_rst(); neg_.reset(); }
             std::this_thread::sleep_for(std::chrono::duration<double>(BURST_RETRY_SLEEP_S));
@@ -212,7 +215,7 @@ InitialBurst Session::negotiate_and_burst() {
         std::vector<uint8_t> buf(65536);
         const int64_t deadline = now_ns() + 30'000'000'000LL;
         int64_t settle = 0;
-        while (now_ns() < deadline) {
+        while (now_ns() < deadline && !cancel_) {
             const int n = sock_video_.recv(buf.data(), buf.size(), 50);
             if (n > 0) { raw.emplace_back(Bytes(buf.begin(), buf.begin() + n), now_ns()); write_record(0, buf.data(), size_t(n), raw.back().second); if (!settle && raw.size() >= (cfg_.codec == VideoCodec::Avc ? 400u : 100u)) settle = now_ns() + 300'000'000; }
             if (settle && now_ns() >= settle) break;
@@ -229,6 +232,7 @@ InitialBurst Session::negotiate_and_burst() {
     p.host = dest_host_; p.port = cfg_.port; p.username = cfg_.username; p.password = cfg_.password; p.srp_first = cfg_.srp_first;
     p.advertise = cfg_.advertise; p.hdr = cfg_.hdr; p.curtain = cfg_.curtain; p.share_console = cfg_.share_console; p.alt_session = cfg_.alt_session;
     p.on_session_choice = cfg_.on_session_choice; p.audio_offer = ao; p.video_offer = vo; p.legacy_cursor = cfg_.legacy_cursor;
+    p.cancelled = [this] { return cancel_.load(); };
     neg_ = std::make_unique<negotiation::Result>(negotiation::connect_and_negotiate(p));
     server_w_ = neg_->server_width; server_h_ = neg_->server_height;
     video_dec_ = neg_->video_decryptor.get();
@@ -259,7 +263,7 @@ InitialBurst Session::negotiate_and_burst() {
     // screen — so report from here, every TX_INTERVAL, on whatever SSRCs the burst has shown so far.
     std::vector<uint32_t> early_sources; std::map<uint32_t, rtcp::SsrcStat> early_stats;
     int64_t next_rr = drain_start; int early_rr_count = 0;
-    while (now_ns() < deadline) {
+    while (now_ns() < deadline && !cancel_) {
         if (now_ns() >= next_rr) {
             send_rr(early_sources, early_stats);
             if (++early_rr_count == 1) LOG_INFO("session", "early RTCP RR sent %.0f ms into the burst drain (%zu source(s))", double(now_ns() - drain_start) / 1e6, early_sources.size());

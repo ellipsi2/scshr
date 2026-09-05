@@ -4,6 +4,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 
+#include <algorithm>
 #include <mutex>
 #include <stdexcept>
 
@@ -43,7 +44,13 @@ void TcpSocket::close_rst() {
     close();
 }
 
-TcpSocket TcpSocket::connect(const std::string& host, uint16_t port, double timeout_s) {
+namespace {
+// A cancel poll is only useful if the wait it guards is short, so long waits run as a series of these.
+constexpr double WAIT_SLICE_S = 0.2;
+timeval to_timeval(double s) { return timeval{long(s), long((s - long(s)) * 1e6)}; }
+}  // namespace
+
+TcpSocket TcpSocket::connect(const std::string& host, uint16_t port, double timeout_s, const std::function<bool()>& cancelled) {
     winsock_init();
     const std::string ip = resolve_ipv4(host);
     SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -53,10 +60,18 @@ TcpSocket TcpSocket::connect(const std::string& host, uint16_t port, double time
     u_long nb = 1; ioctlsocket(s, FIONBIO, &nb);
     int rc = ::connect(s, reinterpret_cast<sockaddr*>(&sa), sizeof sa);
     if (rc == SOCKET_ERROR && WSAGetLastError() != WSAEWOULDBLOCK) { closesocket(s); fail("connect()"); }
-    fd_set wr, ex; FD_ZERO(&wr); FD_ZERO(&ex); FD_SET(s, &wr); FD_SET(s, &ex);
-    timeval tv{long(timeout_s), long((timeout_s - long(timeout_s)) * 1e6)};
-    rc = select(0, nullptr, &wr, &ex, &tv);
-    if (rc == 0) { closesocket(s); throw std::runtime_error(host + ":" + std::to_string(port) + " did not respond. The host may be off, on a different network, behind a firewall, or its IP may have changed."); }
+    double left = timeout_s;
+    fd_set wr, ex;
+    for (;;) {
+        if (cancelled && cancelled()) { closesocket(s); throw std::runtime_error("connecting to " + host + " was cancelled"); }
+        const double slice = cancelled ? std::min(left, WAIT_SLICE_S) : left;
+        FD_ZERO(&wr); FD_ZERO(&ex); FD_SET(s, &wr); FD_SET(s, &ex);
+        timeval tv = to_timeval(slice);
+        rc = select(0, nullptr, &wr, &ex, &tv);
+        if (rc != 0) break;
+        left -= slice;
+        if (left <= 0) { closesocket(s); throw std::runtime_error(host + ":" + std::to_string(port) + " did not respond. The host may be off, on a different network, behind a firewall, or its IP may have changed."); }
+    }
     if (rc < 0 || FD_ISSET(s, &ex)) {
         int err = 0; int len = sizeof err; getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&err), &len);
         closesocket(s);
@@ -66,11 +81,28 @@ TcpSocket TcpSocket::connect(const std::string& host, uint16_t port, double time
     nb = 0; ioctlsocket(s, FIONBIO, &nb);
     BOOL one = TRUE; setsockopt(s, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&one), sizeof one);
     TcpSocket t; t.s_ = uintptr_t(s);
+    t.cancel_ = cancelled;
     t.set_timeout(timeout_s);
     return t;
 }
 
+bool TcpSocket::wait_readable(double timeout_s) {
+    double left = timeout_s > 0 ? timeout_s : 0;
+    for (;;) {
+        if (cancel_ && cancel_()) throw std::runtime_error("waiting for the Mac was cancelled");
+        const double slice = cancel_ ? std::min(left, WAIT_SLICE_S) : left;
+        fd_set rd; FD_ZERO(&rd); FD_SET(SOCKET(s_), &rd);
+        timeval tv = to_timeval(slice);
+        const int rc = select(0, &rd, nullptr, nullptr, &tv);
+        if (rc > 0) return true;
+        if (rc < 0) fail("select()");
+        left -= slice;
+        if (left <= 0) return false;
+    }
+}
+
 void TcpSocket::set_timeout(double seconds) {
+    timeout_s_ = seconds;
     DWORD ms = DWORD(seconds * 1000.0);
     setsockopt(SOCKET(s_), SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&ms), sizeof ms);
     setsockopt(SOCKET(s_), SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&ms), sizeof ms);
@@ -89,6 +121,7 @@ Bytes TcpSocket::recv_exact(size_t n) {
     Bytes out(n);
     size_t off = 0;
     while (off < n) {
+        if (!wait_readable(timeout_s_)) throw std::runtime_error("recv timeout");
         int r = ::recv(SOCKET(s_), reinterpret_cast<char*>(out.data() + off), int(n - off), 0);
         if (r == 0) throw std::runtime_error("peer closed during recv_exact");
         if (r < 0) { if (WSAGetLastError() == WSAETIMEDOUT) throw std::runtime_error("recv timeout"); fail("recv()"); }
@@ -100,6 +133,7 @@ Bytes TcpSocket::recv_exact(size_t n) {
 Bytes TcpSocket::recv_some(size_t max, bool* timed_out) {
     Bytes out(max);
     if (timed_out) *timed_out = false;
+    if (!wait_readable(timeout_s_)) { if (timed_out) *timed_out = true; return {}; }
     int r = ::recv(SOCKET(s_), reinterpret_cast<char*>(out.data()), int(max), 0);
     if (r == 0) throw std::runtime_error("peer closed");
     if (r < 0) {
@@ -111,11 +145,9 @@ Bytes TcpSocket::recv_some(size_t max, bool* timed_out) {
 }
 
 Bytes TcpSocket::peek(size_t n, double timeout_s) {
-    DWORD ms = DWORD(timeout_s * 1000.0);
-    setsockopt(SOCKET(s_), SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&ms), sizeof ms);
+    if (!wait_readable(timeout_s)) return {};
     Bytes out(n);
     int r = ::recv(SOCKET(s_), reinterpret_cast<char*>(out.data()), int(n), MSG_PEEK);
-    set_timeout(15.0);
     if (r <= 0) return {};
     out.resize(size_t(r));
     return out;
