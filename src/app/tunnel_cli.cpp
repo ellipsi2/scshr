@@ -154,8 +154,8 @@ std::string install_windows_tunnel(const std::string& server_code, std::string* 
     bool changed = false;
     try {
         changed = write_conf_if_changed(conf);
-        install_service();
-        if (changed && before == ServiceState::Running) stop_service();
+        const bool binary_changed = install_service();
+        if ((changed || binary_changed) && before == ServiceState::Running) stop_service();
         if (service_state() != ServiceState::Running) start_service();
 
         const RouteAudit audit = audit_routes(srv.mac_ip);

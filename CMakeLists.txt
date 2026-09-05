@@ -193,6 +193,12 @@ add_executable(scshr_vectors tools/vectors.cpp)
 target_link_libraries(scshr_vectors PRIVATE scshr_core)
 
 # ── tests ─────────────────────────────────────────────────────────────────
+# The tunnel service host: a separate, tiny image so the always-on service is not "scshr.exe" in Task
+# Manager and does not lock the application binary. Loads tunnel.dll from its own directory.
+add_executable(scshr_tunnel_service src/app/tunnel_service_main.cpp)
+set_target_properties(scshr_tunnel_service PROPERTIES OUTPUT_NAME scshr-tunnel)
+add_dependencies(scshr scshr_tunnel_service)
+
 add_executable(scshr_tests tests/test_main.cpp tests/test_crypto.cpp tests/test_protocol.cpp tests/test_media.cpp tests/test_tunnel.cpp tests/test_setup.cpp)
 target_link_libraries(scshr_tests PRIVATE scshr_app)
 enable_testing()

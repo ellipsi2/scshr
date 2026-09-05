@@ -178,8 +178,26 @@ struct ScHandle {
     operator SC_HANDLE() const { return h; }
 };
 
+// The service runs from scshr-tunnel.exe next to scshr.exe (see src/app/tunnel_service_main.cpp).
+std::wstring service_host_path() { return exe_dir() + L"\\scshr-tunnel.exe"; }
+
 std::wstring service_command() {
-    return L"\"" + exe_path() + L"\" /wireguard-service \"" + paths().conf + L"\"";
+    return L"\"" + service_host_path() + L"\" /wireguard-service \"" + paths().conf + L"\"";
+}
+
+// The command line the installed service currently has, or "" when it does not exist.
+std::wstring installed_service_command() {
+    ScHandle scm(OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT));
+    if (!scm) return L"";
+    ScHandle svc(OpenServiceW(scm, kServiceName, SERVICE_QUERY_CONFIG));
+    if (!svc) return L"";
+    DWORD need = 0;
+    QueryServiceConfigW(svc, nullptr, 0, &need);
+    if (need == 0) return L"";
+    std::vector<BYTE> buf(need);
+    auto* cfg = reinterpret_cast<QUERY_SERVICE_CONFIGW*>(buf.data());
+    if (!QueryServiceConfigW(svc, cfg, need, &need) || !cfg->lpBinaryPathName) return L"";
+    return cfg->lpBinaryPathName;
 }
 
 bool luid_for_tunnel(NET_LUID& luid) {
@@ -267,6 +285,9 @@ Components validate_components() {
             throw std::runtime_error("bundled WireGuard component missing: " + narrow(*p) +
                                      "\n  run tools/fetch_deps.ps1 (pins WireGuardNT 1.1 + wireguard-windows v0.6.1) and rebuild");
     }
+    if (GetFileAttributesW(service_host_path().c_str()) == INVALID_FILE_ATTRIBUTES)
+        throw std::runtime_error("the tunnel service host is missing: " + narrow(service_host_path()) +
+                                 "\n  scshr-tunnel.exe must sit next to scshr.exe (it is part of the build and the package)");
     return c;
 }
 
@@ -372,7 +393,7 @@ ServiceState service_state() {
     }
 }
 
-void install_service() {
+bool install_service() {
     ScHandle scm(OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CREATE_SERVICE | SC_MANAGER_CONNECT));
     if (!scm) fail("opening the service manager failed");
     const std::wstring cmd = service_command();
@@ -381,12 +402,15 @@ void install_service() {
 
     ScHandle existing(OpenServiceW(scm, kServiceName, SERVICE_CHANGE_CONFIG | SERVICE_QUERY_CONFIG));
     if (existing) {
+        // A different command line (an older install ran the service as scshr.exe, or the folder
+        // moved) only takes effect on the next start: tell the caller so it restarts the service.
+        const bool binary_changed = installed_service_command() != cmd;
         if (!ChangeServiceConfigW(existing, SERVICE_WIN32_OWN_PROCESS, SERVICE_AUTO_START, SERVICE_ERROR_NORMAL,
                                   cmd.c_str(), nullptr, nullptr, L"Nsi\0TcpIp\0\0", nullptr, nullptr, kServiceDisplay))
             fail("reconfiguring the scshr tunnel service failed");
         if (!ChangeServiceConfig2W(existing, SERVICE_CONFIG_SERVICE_SID_INFO, &sid))
             fail("setting the service SID type failed");
-        return;
+        return binary_changed;
     }
     ScHandle svc(CreateServiceW(scm, kServiceName, kServiceDisplay, SERVICE_CHANGE_CONFIG | SERVICE_START,
                                 SERVICE_WIN32_OWN_PROCESS, SERVICE_AUTO_START, SERVICE_ERROR_NORMAL,
@@ -394,6 +418,7 @@ void install_service() {
     if (!svc) fail("creating the scshr tunnel service failed");
     if (!ChangeServiceConfig2W(svc, SERVICE_CONFIG_SERVICE_SID_INFO, &sid))
         fail("setting the service SID type failed");
+    return true;
 }
 
 void start_service() {

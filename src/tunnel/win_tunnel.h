@@ -77,7 +77,8 @@ void save_state(const TunnelState& s);
 enum class ServiceState { Absent, Stopped, StartPending, Running, Other };
 ServiceState service_state();
 // Installs the service if absent, or corrects its binary path if it drifted. Idempotent.
-void install_service();
+// Creates or reconciles the service; true when its binary path changed (it must be restarted).
+bool install_service();
 void start_service();
 void stop_service();
 void delete_service();

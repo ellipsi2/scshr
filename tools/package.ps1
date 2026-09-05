@@ -23,7 +23,7 @@ if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
 New-Item -ItemType Directory -Force $stage | Out-Null
 
 $files = @(
-  "scshr.exe", "avcodec-63.dll", "avutil-61.dll", "swscale-10.dll", "swresample-7.dll",
+  "scshr.exe", "scshr-tunnel.exe", "avcodec-63.dll", "avutil-61.dll", "swscale-10.dll", "swresample-7.dll",
   "libcrypto-3-x64.dll", "tunnel.dll", "wireguard.dll"
 )
 foreach ($f in $files) {
